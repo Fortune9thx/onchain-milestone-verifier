@@ -50,9 +50,11 @@
   6. `verify_milestone(...)` re-triggered — correctly returned `SATISFIED`, released 1 GEN, tranche flipped to `RELEASED`, program's `released` total correctly updated to `1000000000000000000`
 - [x] `README.md` / `PORTAL_SUBMISSION.md` / `FINAL_CHECKLIST.md` updated with the real deployed addresses, transaction results, and both live-only findings
 - [x] Exported wallet keystore and password deleted immediately after the `genlayer-js` scripts that needed them finished running
-- [ ] Pushed to a public GitHub repository under the account's sole-author convention (no AI co-author trailer)
-- [ ] Repository link added to `PORTAL_SUBMISSION.md`
-- [ ] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run
+- [x] Pushed to a public GitHub repository under the account's sole-author convention (no AI co-author trailer) — https://github.com/Fortune9thx/onchain-milestone-verifier
+- [x] Repository link added to `PORTAL_SUBMISSION.md`
+- [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
+
+**Submission is fully ready. Every checkbox in this file is checked; nothing is pending.**
 
 **Known, accepted discrepancy:** one non-functional comment (documenting the §9a finding, discovered live *after* deployment) was added to `contracts/OnChainMilestoneVerifier.py` in this repository after the contract above was deployed. Behavior is unchanged — re-verified via unchanged `genvm-lint check`/`validate` output and the full 36-test suite still passing — so this was not treated as grounds for a third redeploy. The deployed bytecode and this repository's source are functionally identical; they differ only in that one comment.
 
