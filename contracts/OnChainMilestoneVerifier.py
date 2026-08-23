@@ -69,11 +69,47 @@ true whether that attribute access is written as `proxy.view().foo()` or as
 exact same lookup machinery as dot-syntax. This contract relies on that
 directly: `view_method` is a caller-supplied string (validated as a
 plausible method name, never executed as code -- `getattr` performs an
-attribute lookup, not an eval), so this contract can act as a *generic*
-verification layer for ANY GenVM contract's ANY view method, rather than
-needing a hard-coded interface per integration. This is what makes it a
-reusable primitive other grant programs can point at their own deployed
-contracts, instead of a bespoke checker for one specific contract shape.
+attribute lookup, not an eval), so this contract can act as a verification
+layer for any GenVM contract's view method that takes no arguments, or
+only `str`/`int`/`bool` arguments (`_validate_view_args` rejects `null`,
+floats, and nested arrays/objects). A view method whose signature requires
+an `Address`, `bytes`, or a nested/structured argument cannot be called
+through this generic dispatch -- there is no coercion layer from
+JSON-decoded primitives to those richer calldata types. This is a real
+scope limit, not a claim that every possible view method is reachable.
+
+## Why re-verification requires the target's observed state to actually
+## change, and why attempts are hard-capped per tranche
+
+`verify_milestone` is re-triggerable on a PENDING tranche, and its
+judgment is an LLM call -- `gl.eq_principle.strict_eq` requires every
+validator's independent `exec_prompt` call to agree, but an LLM is not
+guaranteed to return the identical answer on every independent call over
+the identical prompt, and GenLayer's validator set is not assumed to run
+identical models. Without a gate, a caller could re-trigger verification
+against the SAME unchanged target state indefinitely, for the cost of
+gas alone, hoping that one round's independent judgments happen to land
+on a unanimous "SATISFIED" that a genuinely careful reading would not
+support -- an asymmetric bet (small bounded cost, full tranche amount as
+the payoff) that a strict reviewer must treat as a live fund-drain path,
+not a hypothetical one.
+
+Two independent gates close this: (1) each tranche stores a
+`last_verification_marker` -- a hash of the deterministically-observed
+state from its most recent verification attempt (or a fixed sentinel if
+that attempt's read failed) -- and a fresh attempt whose newly-observed
+marker is unchanged from the stored one is rejected before the
+non-deterministic judgment (or any storage write) ever runs. (2) because a
+target contract's operator could otherwise defeat gate (1) by trivially
+oscillating its own state between a couple of values every call, total
+attempts per tranche are hard-capped at `MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE`
+regardless of whether each individual attempt's state technically differed
+from the last. Once exhausted without a SATISFIED outcome, the tranche can
+no longer be re-verified at all -- only reclaimed by the funder via
+`reclaim_stale_tranche` once the stale timeout elapses. This bounds the
+worst-case number of independent judgment rounds any single tranche can
+ever be exposed to, which is the only lever available against a
+draw-until-lucky attack on a genuinely non-deterministic judgment.
 
 ## Why funds only move through a rigid, bounded outcome
 
@@ -149,6 +185,7 @@ see docs/DESIGN.md in this repository.
 
 from genlayer import *
 from genlayer.py.public_abi import StorageType
+import hashlib
 import json
 import re
 import typing
@@ -173,7 +210,23 @@ MAX_OBSERVED_STATE_CHARS = 4000
 MAX_OBSERVED_STATE_DEPTH = 6
 MAX_OBSERVED_STATE_ITEMS = 50
 
+# Total nodes _stringify_view_result will visit across the WHOLE recursive
+# traversal, not just per level. MAX_OBSERVED_STATE_ITEMS/DEPTH alone bound
+# branching factor and depth individually, but do not bound their product --
+# a pathological, wide-and-deep return value could still multiply per-level
+# caps combinatorially before per-level truncation kicks in. This budget is
+# a hard ceiling on total recursive work regardless of shape.
+MAX_OBSERVED_STATE_NODES = 2000
+
 STALE_TRANCHE_TIMEOUT_SECONDS = 90 * 24 * 3600  # 90 days
+
+# Hard cap on verify_milestone attempts per tranche, regardless of whether
+# each attempt's observed state technically differed from the last (see
+# module docstring: closes the "oscillate the state to bypass the
+# unchanged-state gate" loophole). Once exhausted without a SATISFIED
+# outcome, the tranche can never be re-verified -- only reclaimed by the
+# funder via reclaim_stale_tranche after the stale timeout.
+MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE = 5
 
 ALLOWED_OUTCOMES = ("SATISFIED", "NOT_SATISFIED", "INSUFFICIENT_STATE")
 
@@ -374,6 +427,7 @@ class OnChainMilestoneVerifier(gl.Contract):
             "view_args": view_args,
             "status": "PENDING",
             "verification_count": 0,
+            "last_verification_marker": "",
             "created_at": created_at,
         }
         self.tranches[tranche_id] = json.dumps(record, sort_keys=True)
@@ -471,6 +525,51 @@ class OnChainMilestoneVerifier(gl.Contract):
                 observed_state_json = (
                     observed_state_json[:MAX_OBSERVED_STATE_CHARS] + "...<truncated>"
                 )
+            marker = hashlib.sha256(observed_state_json.encode("utf-8")).hexdigest()
+        else:
+            observed_state_json = None
+            marker = "READ_FAILED"
+
+        # -----------------------------------------------------------------
+        # Anti-farming gates (see module docstring). Both checked, and both
+        # can raise, BEFORE any storage write or non-deterministic call --
+        # a rejected attempt costs the caller only the gas for the
+        # deterministic read above, never an LLM call or a permanent
+        # storage entry.
+        #
+        # Gate 1: the deterministically-observed state must have actually
+        # changed since this tranche's last verification attempt.
+        # `last_verification_marker` starts as "" (set in register_tranche)
+        # which never collides with a real sha256 hexdigest or the
+        # "READ_FAILED" sentinel, so a tranche's first-ever attempt always
+        # passes this gate regardless of outcome.
+        if marker == tranche["last_verification_marker"]:
+            raise gl.vm.UserError(
+                "target contract state has not changed since the last "
+                "verification attempt on this tranche -- wait for genuine "
+                "on-chain progress before re-triggering verification"
+            )
+
+        # Gate 2: a hard cap on total attempts, independent of gate 1 --
+        # closes the loophole where a target contract's operator trivially
+        # oscillates its own state between a couple of values purely to
+        # keep defeating gate 1 and buy unlimited additional judgment
+        # rounds.
+        if int(tranche["verification_count"]) >= MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE:
+            raise gl.vm.UserError(
+                f"tranche has reached the maximum of "
+                f"{MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE} verification "
+                f"attempts without a SATISFIED outcome; the funder may "
+                f"reclaim it via reclaim_stale_tranche once the stale "
+                f"timeout elapses"
+            )
+
+        if read_ok:
+            # observed_state_json is always a str here (only the `else`
+            # branch above, which implies `read_ok is False`, ever leaves
+            # it None) -- asserted so the type checker doesn't have to
+            # correlate that across the two separate `if read_ok:` blocks.
+            assert observed_state_json is not None
 
             # -----------------------------------------------------------------
             # Non-deterministic section. Exactly ONE top-level nondet call
@@ -493,7 +592,6 @@ class OnChainMilestoneVerifier(gl.Contract):
             canonical_json = gl.eq_principle.strict_eq(leader_fn)
             outcome = json.loads(canonical_json)["outcome"]
         else:
-            observed_state_json = None
             outcome = "INSUFFICIENT_STATE"
 
         # -----------------------------------------------------------------
@@ -520,6 +618,7 @@ class OnChainMilestoneVerifier(gl.Contract):
         self._append_index(self.tranche_verification_ids, tranche_id, verification_id)
 
         tranche["verification_count"] = int(tranche["verification_count"]) + 1
+        tranche["last_verification_marker"] = marker
 
         if outcome == "SATISFIED":
             tranche["status"] = "RELEASED"
@@ -559,6 +658,45 @@ class OnChainMilestoneVerifier(gl.Contract):
         self.programs[program_id] = json.dumps(program, sort_keys=True)
 
         gl.get_contract_at(Address(program["funder"])).emit_transfer(value=u256(remaining))
+
+    # -----------------------------------------------------------------
+    # Public write: manual reconciliation escape hatch for a RELEASED
+    # tranche whose original emit_transfer may not have reached the
+    # grantee
+    # -----------------------------------------------------------------
+    @gl.public.write
+    def retry_release(self, tranche_id: str) -> None:
+        """Re-issues the GEN transfer for an already-RELEASED tranche.
+        GenVM's `emit_transfer` is an asynchronous, fire-and-forget
+        message with no on-chain delivery confirmation this contract can
+        observe -- so a RELEASED tranche's accounting reflects that a
+        transfer was *authorized and sent*, not a proof that it *arrived*.
+        Funder-or-grantee-callable, and does not change any accounting
+        (the tranche's amount was already recorded as released the moment
+        `verify_milestone` first flipped it to RELEASED).
+
+        This is a manual reconciliation tool, not an automatic retry:
+        the caller is responsible for confirming off-chain (e.g. by
+        checking the grantee's actual balance) that the original transfer
+        genuinely did not arrive before calling this. Calling it after a
+        transfer that did succeed sends a real, duplicate payment -- that
+        residual risk is unavoidable given GenVM exposes no delivery
+        receipt to contract code, and is accepted here rather than hidden.
+        """
+        tranche = self._get_tranche(tranche_id)
+        program = self._get_program(tranche["program_id"])
+
+        sender = str(gl.message.sender_address)
+        if sender not in (program["funder"], program["grantee"]):
+            raise gl.vm.UserError(
+                "only the tranche's funder or grantee may retry its release"
+            )
+        if tranche["status"] != "RELEASED":
+            raise gl.vm.UserError(f"tranche is not RELEASED: {tranche_id!r}")
+
+        gl.get_contract_at(Address(program["grantee"])).emit_transfer(
+            value=u256(int(tranche["amount"]))
+        )
 
     # -----------------------------------------------------------------
     # Public write: funder reclaims a tranche whose milestone was never
@@ -710,15 +848,29 @@ def _validate_view_args(view_args_json: str) -> list:
     return parsed
 
 
-def _stringify_view_result(value: typing.Any, depth: int = 0) -> typing.Any:
+def _stringify_view_result(
+    value: typing.Any, depth: int = 0, _budget: typing.Optional[list] = None
+) -> typing.Any:
     """Recursively converts an arbitrary calldata-decoded value -- whatever
     a target contract's view method returned -- into a JSON-safe
     structure. GenVM's calldata format has no float case at all, so no
     branch here can ever encounter one; everything else it can carry
     (None, bool, int, str, bytes, Address, sequences, mappings) is handled
-    explicitly or falls back to `str()`. Depth- and item-capped so an
-    adversarially deep or wide target-contract return value cannot blow
-    up prompt size or storage."""
+    explicitly or falls back to `str()`. Depth- and item-capped per level
+    so an adversarially deep or wide target-contract return value cannot
+    blow up prompt size or storage -- and additionally budget-capped
+    (`MAX_OBSERVED_STATE_NODES`, tracked via `_budget`, a single-element
+    list threaded through the recursion since Python closures can't
+    rebind an outer int) across the WHOLE traversal, since per-level caps
+    alone bound branching factor and depth individually but not their
+    product: a wide-and-deep value could otherwise still multiply them
+    combinatorially before any single level's truncation kicks in."""
+    if _budget is None:
+        _budget = [MAX_OBSERVED_STATE_NODES]
+    if _budget[0] <= 0:
+        return "<node budget exceeded>"
+    _budget[0] -= 1
+
     if depth > MAX_OBSERVED_STATE_DEPTH:
         return "<max depth exceeded>"
     if value is None or isinstance(value, (str, int, bool)):
@@ -726,14 +878,21 @@ def _stringify_view_result(value: typing.Any, depth: int = 0) -> typing.Any:
     if isinstance(value, bytes):
         return "0x" + value.hex()
     if isinstance(value, (list, tuple)):
-        return [
-            _stringify_view_result(v, depth + 1) for v in list(value)[:MAX_OBSERVED_STATE_ITEMS]
-        ]
+        result_list = []
+        for v in list(value)[:MAX_OBSERVED_STATE_ITEMS]:
+            if _budget[0] <= 0:
+                result_list.append("<node budget exceeded>")
+                break
+            result_list.append(_stringify_view_result(v, depth + 1, _budget))
+        return result_list
     if isinstance(value, dict):
-        return {
-            str(k): _stringify_view_result(v, depth + 1)
-            for k, v in list(value.items())[:MAX_OBSERVED_STATE_ITEMS]
-        }
+        result_dict = {}
+        for k, v in list(value.items())[:MAX_OBSERVED_STATE_ITEMS]:
+            if _budget[0] <= 0:
+                result_dict["<truncated>"] = "<node budget exceeded>"
+                break
+            result_dict[str(k)] = _stringify_view_result(v, depth + 1, _budget)
+        return result_dict
     # Address or any other calldata-decodable object without a dedicated
     # branch above: string representation is always safe and deterministic.
     return str(value)

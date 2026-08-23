@@ -2,7 +2,7 @@
 
 A reusable [GenLayer](https://genlayer.com) Intelligent Contract primitive that releases escrowed grant/bounty funds only when independent validators agree that a target contract's actual, already-finalized on-chain state satisfies a plain-language milestone.
 
-**Deployed on Testnet Bradbury:** [`0xF5Df96807a6c71b273F361633d19529c8B7918e7`](https://explorer-bradbury.genlayer.com/address/0xF5Df96807a6c71b273F361633d19529c8B7918e7) — deploy `FINALIZED`/`AGREE`/`FINISHED_WITH_RETURN`, post-deploy read confirmed. Live-verified end-to-end with a real 2 GEN escrow: `create_program` → `register_tranche` (gated on [`DeploymentStatusTarget`](examples/deployment_status_target.py), deployed at `0xa775A4BAd9DEC803e61CD4b5c42c6988d356f918`) → `verify_milestone` correctly returned `NOT_SATISFIED` while the target read `"PENDING"` (no funds moved) → target marked `LIVE` → `verify_milestone` re-triggered, correctly returned `SATISFIED`, released 1 GEN, tranche flipped to `RELEASED`. See [docs/DESIGN.md §9a](docs/DESIGN.md#9a-a-second-real-finding-from-the-live-bradbury-deployment-itself-querying-a-not-yet-finalized-target-is-a-hard-vm-fault-not-a-soft-one) for a real, live-only failure mode this test also surfaced and confirmed the cause of.
+**Deployed on Testnet Bradbury (current, post-fix):** [`0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836`](https://explorer-bradbury.genlayer.com/address/0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836) — deploy tx `0x4a979ae61361e4802bd3fc54ec6c8132e9f99f008a95bb57c4ca6db74f35f032`, confirmed `FINALIZED`/`AGREE`/`FINISHED_WITH_RETURN` (5/5 validators agreed), post-deploy read confirmed (`get_program_count() == 0`). This redeploy carries the fixes from the adversarial post-launch review documented in [docs/DESIGN.md §12](docs/DESIGN.md#12-a-maximally-adversarial-post-launch-review-and-the-fixes-it-produced) and `CHANGELOG.md` — see those for the full list. The mechanism itself (deterministic cross-contract read + independent judgment + fund release) was already live-verified end-to-end with real GEN on the original 1.0.0 deployment; see `CHANGELOG.md`'s `[1.0.0]` entry for that record.
 
 ## The trust problem
 
@@ -63,7 +63,11 @@ The only thing this contract's Equivalence Principle round ever agrees on is one
 
 ## Why the target view method is called by name, not a fixed interface
 
-`view_method` is a caller-supplied string, resolved at call time via `getattr(contract.view(state=...), view_method)(*args)` — GenLayer's own cross-contract proxy mechanism supports this natively (`__getattr__`-based dynamic dispatch), confirmed by direct testing before this contract was written, not assumed. This is what makes the contract a genuinely *reusable* verification layer — any GenLayer program can point it at their own deployed contract's own view methods, rather than needing a bespoke checker per integration.
+`view_method` is a caller-supplied string, resolved at call time via `getattr(contract.view(state=...), view_method)(*args)` — GenLayer's own cross-contract proxy mechanism supports this natively (`__getattr__`-based dynamic dispatch), confirmed by direct testing before this contract was written, not assumed. This is what makes the contract a genuinely reusable verification layer for any view method taking no arguments, or only `str`/`int`/`bool` arguments — a view method requiring an `Address`, `bytes`, or a nested/structured argument is out of scope, since there is no coercion layer from JSON-decoded primitives to those richer calldata types.
+
+## Why re-verification requires genuine state change, and is hard-capped
+
+`verify_milestone`'s judgment is a real LLM call, and `gl.eq_principle.strict_eq` only guarantees that *whatever* a given round's independent judgments agree on is accepted — it does not guarantee two separate rounds over the identical, unchanged observed state will agree with *each other*. Left ungated, a party to a tranche could re-trigger verification against the same unchanged target state indefinitely, for gas alone, until one round's independent judgments happened to land on an unwarranted `SATISFIED` — a small, bounded cost against the full tranche amount as payoff. Two gates close this: (1) each attempt's observed-state hash must differ from the tranche's last attempt, checked and enforced *before* any LLM call or storage write, so a same-state retry costs only the deterministic read; (2) total attempts per tranche are hard-capped at `MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE`, regardless of whether each attempt's state technically differed, closing the loophole where a target contract's own operator could otherwise oscillate its state between a couple of values purely to keep re-arming gate (1).
 
 ## Contract interface
 
@@ -71,8 +75,9 @@ The only thing this contract's Equivalence Principle round ever agrees on is one
 |---|---|---|
 | `create_program(grantee: str) -> str` | write, payable | Escrows `msg.value` GEN for `grantee`, returns the new `program_id` |
 | `register_tranche(program_id, amount, milestone_description, target_contract, view_method, view_args_json="[]") -> str` | write | Funder-only. Registers a milestone-gated tranche against the program's unallocated escrow, returns `tranche_id` |
-| `verify_milestone(tranche_id) -> str` | write | Funder-or-grantee. Deterministic read + independent judgment; releases funds on `SATISFIED`. Returns `verification_id` |
+| `verify_milestone(tranche_id) -> str` | write | Funder-or-grantee. Deterministic read + independent judgment; releases funds on `SATISFIED`. Rejects a re-attempt whose observed state is unchanged since the last attempt, and caps total attempts per tranche at `MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE`. Returns `verification_id` |
 | `withdraw_unallocated(program_id) -> None` | write | Funder-only. Refunds escrow never allocated to a tranche |
+| `retry_release(tranche_id) -> None` | write | Funder-or-grantee. Manual reconciliation escape hatch: re-issues the transfer for an already-`RELEASED` tranche whose original `emit_transfer` may not have arrived |
 | `reclaim_stale_tranche(tranche_id) -> None` | write | Funder-only, after 90 days with no successful verification. Reclaims a tranche's allocation, marks it `EXPIRED` |
 | `get_program(program_id) -> str` | view | Full JSON program record |
 | `get_tranche(tranche_id) -> str` | view | Full JSON tranche record |

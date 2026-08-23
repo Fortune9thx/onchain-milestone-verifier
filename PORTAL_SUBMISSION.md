@@ -25,10 +25,11 @@ OnChainMilestoneVerifier releases escrowed grant/bounty GEN only when independen
 ## Deployed contract
 
 - **Network:** GenLayer Testnet Bradbury
-- **Address:** `0xF5Df96807a6c71b273F361633d19529c8B7918e7`
-- **Deploy transaction:** confirmed `FINALIZED`/`AGREE`/`FINISHED_WITH_RETURN`
-- **Explorer:** https://explorer-bradbury.genlayer.com/address/0xF5Df96807a6c71b273F361633d19529c8B7918e7
-- **Live verification (full lifecycle, real GEN):**
+- **Address (current, post-fix):** `0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836`
+- **Deploy transaction:** `0x4a979ae61361e4802bd3fc54ec6c8132e9f99f008a95bb57c4ca6db74f35f032`, confirmed `FINALIZED`/`AGREE`/`FINISHED_WITH_RETURN` (5/5 validators agreed), post-deploy read confirmed (`get_program_count() == 0`)
+- **Explorer:** https://explorer-bradbury.genlayer.com/address/0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836
+- **Why redeployed:** a maximally adversarial post-launch review (source-only, no design docs consulted) found and fixed five issues in the original 1.0.0 deployment, one critical — see `CHANGELOG.md`'s `[1.1.0]` entry and `docs/DESIGN.md` §12 for the full account. None changed a public method's signature except the addition of `retry_release`.
+- **Live verification (full lifecycle, real GEN, recorded on the original 1.0.0 deployment — the underlying mechanism is unchanged by the fixes above):**
   1. `create_program(grantee)` with a real 2 GEN deposit — escrow correctly recorded (`total_escrowed: 2000000000000000000`)
   2. `register_tranche(...)` for 1 GEN, gated on a real deployed target contract ([`DeploymentStatusTarget`](examples/deployment_status_target.py) at `0xa775A4BAd9DEC803e61CD4b5c42c6988d356f918`)'s `deployment_status()` view method
   3. `verify_milestone(...)` while the target read `"PENDING"` — correctly independently judged `NOT_SATISFIED`, zero funds moved
@@ -45,13 +46,14 @@ https://github.com/Fortune9thx/onchain-milestone-verifier
 
 - Independent re-execution consensus via `gl.eq_principle.strict_eq` over a real cross-contract read — no shape-only validator exists to get wrong.
 - **A genuinely different evidence category** from web-fetch-based oracles: on-chain finalized state, read deterministically outside any non-deterministic block (cross-contract calls are forbidden inside one), rather than re-fetched per validator.
-- Dynamic, name-based cross-contract dispatch (`getattr`-resolved view calls) makes this a generic verification layer for *any* GenLayer contract's *any* view method, not a bespoke checker.
+- Dynamic, name-based cross-contract dispatch (`getattr`-resolved view calls) makes this a generic verification layer for target view methods taking no arguments, or only `str`/`int`/`bool` arguments, not a bespoke checker.
 - Rigid, three-value bounded outcome (`SATISFIED`/`NOT_SATISFIED`/`INSUFFICIENT_STATE`) — no confidence scores or free text in the compared payload.
-- Real escrow economics: checks-effects-interactions fund release, unallocated-balance withdrawal, and a fixed-timeout stale-tranche reclaim so funds can never be locked forever behind an abandoned milestone.
+- Real escrow economics: checks-effects-interactions fund release, unallocated-balance withdrawal, a fixed-timeout stale-tranche reclaim, and a `retry_release` manual reconciliation path so funds can never be locked forever or silently stranded by a single failed async transfer.
+- Re-verification requires the target's observed state to genuinely change since the last attempt, and is hard-capped at a fixed number of attempts per tranche — closes a real, self-identified fund-drain path where unlimited free retries against a stochastic LLM judgment could otherwise be farmed for a lucky false-positive `SATISFIED`. See `docs/DESIGN.md` §12.
 - A real bug found and fixed by the test suite before deployment (a failed cross-contract read doesn't raise, contrary to the initial assumption) — documented transparently, not hidden. See `docs/DESIGN.md` §9.
 - A second real finding surfaced only by live deployment (§9a): a not-yet-finalized target contract makes `LATEST_FINAL` reads fault at the VM level, not the Python level — confirmed, understood, and documented as an operational sequencing note for integrators, not glossed over.
 - Live-verified end-to-end on Bradbury with real GEN: a full escrow → tranche → `NOT_SATISFIED` → `mark_live` → `SATISFIED` → fund-release cycle, not just mocked tests.
-- 36 passing direct-mode tests (including a project-built mock for cross-contract calls, since `gltest` has no built-in one), `genvm-lint check`/`validate` both clean, CI running all three on every push.
+- 42 passing direct-mode tests (including a project-built mock for cross-contract calls, since `gltest` has no built-in one), `genvm-lint check`/`validate` both clean, CI running all three on every push.
 
 ## Evidence of quality
 
@@ -60,10 +62,10 @@ $ genvm-lint check contracts/OnChainMilestoneVerifier.py
 ✓ Lint passed (3 checks)
 ✓ Validation passed
   Contract: OnChainMilestoneVerifier
-  Methods: 13 (8 view, 5 write)
+  Methods: 14 (8 view, 6 write)
 
 $ gltest tests/direct/test_onchain_milestone_verifier.py -v
-============================= 36 passed in 2.71s ==============================
+============================= 42 passed in 2.98s ==============================
 ```
 
 ## Links

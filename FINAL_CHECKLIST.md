@@ -54,8 +54,25 @@
 - [x] Repository link added to `PORTAL_SUBMISSION.md`
 - [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
 
-**Submission is fully ready. Every checkbox in this file is checked; nothing is pending.**
+## Post-fix redeploy (current)
 
-**Known, accepted discrepancy:** one non-functional comment (documenting the §9a finding, discovered live *after* deployment) was added to `contracts/OnChainMilestoneVerifier.py` in this repository after the contract above was deployed. Behavior is unchanged — re-verified via unchanged `genvm-lint check`/`validate` output and the full 36-test suite still passing — so this was not treated as grounds for a third redeploy. The deployed bytecode and this repository's source are functionally identical; they differ only in that one comment.
+A maximally adversarial post-launch review found and fixed five real issues (one critical) in `contracts/OnChainMilestoneVerifier.py`, including a genuine fund-drain path (unlimited free re-verification against a stochastic LLM judgment). See `CHANGELOG.md`'s `[1.1.0]` entry and `docs/DESIGN.md` §12 for the full account.
+
+- [x] Fixes applied; test suite grew 36 → 42, all passing; `genvm-lint check`/`validate` both clean on the fixed source
+- [x] Redeployed to GenLayer Testnet Bradbury: `0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836`, deploy tx `0x4a979ae61361e4802bd3fc54ec6c8132e9f99f008a95bb57c4ca6db74f35f032`
+- [x] Post-deploy read verified (`get_program_count() == 0`)
+- [x] Deploy transaction reached genuine `FINALIZED` status, confirmed `AGREE`/`FINISHED_WITH_RETURN` (5/5 validators agreed)
+- [x] `README.md` / `PORTAL_SUBMISSION.md` updated with the new address and an honest account of why the redeploy happened
+- [x] Pushed to GitHub
+
+The original 1.0.0 deployment (`0xF5Df96807a6c71b273F361633d19529c8B7918e7`) is superseded by the address above and should no longer be treated as this contract's current, correct deployment — it still runs the pre-fix logic (no live financial exposure at time of writing: its one tranche already released and closed, and the small unallocated balance remaining is safely withdrawable regardless of the fix). The full live end-to-end proof recorded below, from the original deployment, remains valid evidence for the underlying mechanism (deterministic read → independent judgment → fund release), which the fixes did not change.
+
+---
+
+*(Original 1.0.0 sign-off below, retained for history.)*
+
+**Submission was ready as of 1.0.0. Every checkbox in this file was checked at that time; see the note above for what has changed since.**
+
+**Known, accepted discrepancy (1.0.0 only):** one non-functional comment (documenting the §9a finding, discovered live *after* deployment) was added to `contracts/OnChainMilestoneVerifier.py` in this repository after the contract above was deployed. Behavior was unchanged at that time — re-verified via unchanged `genvm-lint check`/`validate` output and the full 36-test suite still passing — so this was not treated as grounds for a third redeploy. The deployed bytecode and the 1.0.0 repository source were functionally identical; they differed only in that one comment.
 
 *(Deployment and publication checkboxes are updated in place once each step completes — this file is the single source of truth for submission readiness.)*

@@ -326,6 +326,71 @@ def test_verify_milestone_can_be_retriggered_after_not_satisfied(direct_deploy, 
     assert json.loads(contract.list_verification_ids(tranche_id)) == [first_id, second_id]
 
 
+def test_verify_milestone_rejects_repeat_attempt_with_unchanged_state(direct_deploy, direct_vm):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+
+    _mock_state_read(direct_vm, "IN_PROGRESS")
+    direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    # Same target state as before -> rejected before any LLM call or write,
+    # even though a fresh (unused) LLM mock is still registered.
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    with direct_vm.expect_revert("state has not changed"):
+        contract.verify_milestone(tranche_id)
+
+    tranche = json.loads(contract.get_tranche(tranche_id))
+    assert tranche["status"] == "PENDING"
+    assert tranche["verification_count"] == 1
+    assert json.loads(contract.list_verification_ids(tranche_id)) == [
+        f"{tranche_id}-verify-0"
+    ]
+
+
+def test_verify_milestone_rejects_after_max_attempts_reached(direct_deploy, direct_vm):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    mod = _module()
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+
+    for i in range(mod.MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE):
+        direct_vm.clear_mocks()
+        _mock_state_read(direct_vm, f"STATE-{i}")
+        direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+        contract.verify_milestone(tranche_id)
+
+    tranche = json.loads(contract.get_tranche(tranche_id))
+    assert tranche["verification_count"] == mod.MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE
+
+    direct_vm.clear_mocks()
+    _mock_state_read(direct_vm, "STATE-final-and-different")
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    with direct_vm.expect_revert("maximum"):
+        contract.verify_milestone(tranche_id)
+
+
+def test_verify_milestone_can_be_retriggered_when_state_genuinely_changes_after_failure(
+    direct_deploy, direct_vm
+):
+    """Distinct from the unchanged-state rejection above: a genuinely
+    different observed state each time must keep working, up to the cap."""
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+
+    _mock_state_read(direct_vm, "IN_PROGRESS")
+    direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    first_id = contract.verify_milestone(tranche_id)
+
+    direct_vm.clear_mocks()
+    _mock_state_read(direct_vm, "STILL_IN_PROGRESS")
+    direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    second_id = contract.verify_milestone(tranche_id)
+
+    assert first_id != second_id
+    tranche = json.loads(contract.get_tranche(tranche_id))
+    assert tranche["verification_count"] == 2
+
+
 def test_verify_milestone_rejects_on_already_released(direct_deploy, direct_vm):
     contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
     _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
@@ -415,6 +480,43 @@ def test_verify_milestone_passes_view_args_through(direct_deploy, direct_vm):
     verification = json.loads(contract.get_verification(verification_id))
     assert verification["outcome"] == "SATISFIED"
     assert verification["observed_state"] == "500"
+
+
+# ---------------------------------------------------------------------------
+# retry_release
+# ---------------------------------------------------------------------------
+
+
+def test_retry_release_happy_path(direct_deploy, direct_vm):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+    _mock_state_read(direct_vm, "DONE")
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    # Does not raise, and does not change any accounting.
+    contract.retry_release(tranche_id)
+    tranche = json.loads(contract.get_tranche(tranche_id))
+    assert tranche["status"] == "RELEASED"
+
+
+def test_retry_release_rejects_when_not_released(direct_deploy, direct_vm):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+    with direct_vm.expect_revert("not RELEASED"):
+        contract.retry_release(tranche_id)
+
+
+def test_retry_release_rejects_non_funder_non_grantee(direct_deploy, direct_vm, direct_alice):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+    _mock_state_read(direct_vm, "DONE")
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    direct_vm.sender = direct_alice
+    with direct_vm.expect_revert("only the tranche's funder or grantee"):
+        contract.retry_release(tranche_id)
 
 
 # ---------------------------------------------------------------------------
@@ -589,6 +691,15 @@ def test_stringify_view_result_unit(direct_deploy, direct_vm):
     long_list = list(range(200))
     result = mod._stringify_view_result(long_list)
     assert len(result) == mod.MAX_OBSERVED_STATE_ITEMS
+
+    # Total-node budget: per-level item/depth caps alone don't bound their
+    # product (50 items * 50 nested items = 2550 nodes, well within depth 6
+    # but over MAX_OBSERVED_STATE_NODES=2000) -- the budget must still
+    # truncate this promptly and leave the result JSON-safe.
+    wide = [["x"] * mod.MAX_OBSERVED_STATE_ITEMS for _ in range(mod.MAX_OBSERVED_STATE_ITEMS)]
+    result = mod._stringify_view_result(wide)
+    encoded = json.dumps(result)  # must still be JSON-safe, no exception
+    assert "<node budget exceeded>" in encoded
 
 
 def test_validate_view_args_unit(direct_deploy, direct_vm):
