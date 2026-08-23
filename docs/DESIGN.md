@@ -1,0 +1,100 @@
+# Design
+
+Deep rationale for `OnChainMilestoneVerifier`: why it is built the way it is, what threats it defends against, and what its honest limitations are.
+
+## 1. The core problem this contract solves
+
+A milestone-gated grant needs a third party to decide whether the milestone is actually met. The traditional options are both bad: a human reviewer (capturable, slow, a single point of trust neither party should have to accept) or a naive on-chain comparison against a value someone typed in ahead of time (which just moves the trust problem to "who gets to type in the expected value," and is exactly the kind of Gate-C-failing pattern — a judgment that collapses to a deterministic equality check — that should never need a GenLayer Intelligent Contract in the first place). This contract is designed so neither trap applies: it reads a real deployed contract's real state and asks every validator, independently, to interpret it.
+
+## 2. Deterministic evidence, non-deterministic judgment — the central architectural decision
+
+`verify_milestone` does exactly one cross-contract read and exactly one non-deterministic call, and they are deliberately *not* the same step:
+
+```python
+raw_state = getattr(
+    gl.get_contract_at(Address(target_contract)).view(state=StorageType.LATEST_FINAL),
+    view_method,
+)(*view_args)
+...
+canonical_json = gl.eq_principle.strict_eq(leader_fn)  # leader_fn closes over the already-read state
+```
+
+The read happens first, in the contract's ordinary deterministic body. This is correct, not merely convenient, for a specific reason: a deployed GenVM contract's **finalized** state is canonical and identical for every node that reads it, by the same guarantee that makes the rest of the chain deterministic. It does not need independent re-fetching to be trustworthy the way a fetched web page would (see [IndependentCanonicalExtractor](https://github.com/Fortune9thx/independent-canonical-extractor)'s own design docs for that contrasting case) — every validator that reads it gets the same answer regardless of who reads it or exactly when, as long as they all read the same finalized state. `strict_eq`'s `leader_fn` simply closes over that already-computed value as a plain local; `spawn_sandbox`'s independent re-execution of `leader_fn` on every validator re-runs the LLM call, not the read, because the read was never inside the non-deterministic boundary to begin with.
+
+This is also why `.view(state=StorageType.LATEST_FINAL)` is used explicitly rather than the SDK's own default (`StorageType.LATEST_NON_FINAL`). "Latest non-final" state can genuinely differ node-to-node — if a competing transaction against the target contract is itself still being decided when different validators process this transaction, they could observe different values, which would make the read non-deterministic in exactly the way this design otherwise avoids. Requesting explicitly-finalized state closes that gap.
+
+Cross-contract calls (`CallContract`, along with `DeployContract`/`PostMessage`) are forbidden inside a non-deterministic block on real GenVM (`SystemError: 6`) — confirmed both by reading the installed SDK/`gltest` mock enforcement and by prior projects in this account's history. This is not an obstacle this contract works around; it is exactly consistent with the architecture above. The read belongs in the deterministic body because it *is* deterministic.
+
+## 3. Dynamic, name-based cross-contract dispatch
+
+`view_method` is a caller-supplied string, resolved via `getattr(proxy.view(...), view_method)(*view_args)`. This works because `gl.get_contract_at(address)`'s `.view()`/`.emit()` namespaces are backed by Python's ordinary `__getattr__` protocol (`genlayer.gl.genvm_contracts._ContractAtGetter`) — `getattr(obj, name_string)` triggers the identical lookup machinery as `obj.name` written literally, so a runtime string works exactly as well as a compile-time attribute access.
+
+This was verified directly, not assumed: before this contract was written, a standalone two-contract probe (a throwaway `Probe` contract calling `getattr(gl.get_contract_at(Address(target)).view(...), method_name)(*args)` against a mocked target) was deployed in `gltest` direct-mode and confirmed to round-trip correctly — including with arguments, and including confirming that an unmocked/nonexistent call does *not* raise cleanly (see §9 below, the real bug this uncovered). This is what makes the contract a genuine reusable primitive: any GenLayer program can point it at their own deployed contract's own view methods without OnChainMilestoneVerifier needing to declare an interface for every possible integration in advance.
+
+## 4. Why funds only move through a rigid, three-value outcome
+
+`leader_fn` returns exactly `json.dumps({"outcome": <SATISFIED|NOT_SATISFIED|INSUFFICIENT_STATE>}, sort_keys=True)`. There is no confidence score, no percentage, no free-text rationale in the compared payload — the same unbound-quantitative-outcome shape that has been a documented GenLayer Portal rejection reason for other contracts in this account's history. `_extract_outcome` fails closed to `NOT_SATISFIED` on any parse failure or value outside the three-member enum — never to `SATISFIED` — since funds must never move on an ambiguous or malformed judgment.
+
+## 5. Escrow and economic design
+
+- **Programs escrow a lump sum; tranches allocate against it.** A funder deposits once (`create_program`), then registers tranches (`register_tranche`) whose amounts are checked against the program's *unallocated* remainder (`total_escrowed - allocated`), never against the raw escrowed total directly — so multiple tranches can never over-commit a program's funds.
+- **Checks-effects-interactions throughout.** In `verify_milestone`, a tranche's status flips to `RELEASED` in storage, and the program's `released` total is updated, strictly *before* `emit_transfer` is invoked. `withdraw_unallocated` reduces `total_escrowed` before transferring. `reclaim_stale_tranche` reduces `allocated` before returning control. `emit_transfer` itself queues an asynchronous message executed later at finalization (not a synchronous call), so there is no Solidity-style re-entrancy path into these methods regardless — the CEI ordering is defense in depth, matching this account's established practice on other payout-bearing contracts, not a fix for a re-entrancy vulnerability that could otherwise occur.
+- **A failed EOA transfer is not auto-refunded.** This is documented GenLayer platform behavior, not a bug in this contract, and is an accepted trade-off consistent with other contracts in this account's portfolio that move value.
+- **`reclaim_stale_tranche` prevents funds locked forever behind an abandoned milestone.** After `STALE_TRANCHE_TIMEOUT_SECONDS` (90 days, a fixed contract constant) with a tranche still `PENDING`, the funder may reclaim its allocation back into the program's unallocated balance. The timeout is a contract constant rather than a caller-supplied parameter deliberately: letting the funder pick their own timeout would let them unilaterally set an unreasonably short window against the grantee, which cuts against the same "neither party should unilaterally decide" principle the milestone judgment itself exists to uphold.
+
+## 6. Non-determinism boundaries
+
+- `leader_fn` (a named `def`, never a `lambda`) is the only place in this contract that calls `gl.nondet.exec_prompt`. It closes only over plain locals (`milestone_description`, `observed_state_json`) computed earlier in `verify_milestone`'s deterministic body — it never reads or writes `self.*` storage, and it performs no cross-contract call of its own.
+- Every storage write and every `emit_transfer` in `verify_milestone` happens strictly after `gl.eq_principle.strict_eq` has already returned.
+- Exactly one non-deterministic call exists per write method that has one at all (`verify_milestone`'s single `strict_eq`); `create_program`, `register_tranche`, `withdraw_unallocated`, and `reclaim_stale_tranche` are fully deterministic and contain none.
+
+## 7. Storage design
+
+Every record (`programs`, `tranches`, `verifications`) and every index list (`program_tranche_ids`, `tranche_verification_ids`, `grantee_tranche_ids`) is a JSON-encoded `str` value in a `TreeMap[str, str]`, consistent with this account's established Bradbury storage practice. `program_ids` is the one genuine top-level `DynArray[str]`. Two things worth being explicit about:
+
+- **A `TreeMap[str, DynArray[str]]`-shaped index (nesting a collection as a TreeMap value) was deliberately not used**, even though this project's sibling ([IndependentCanonicalExtractor](https://github.com/Fortune9thx/independent-canonical-extractor)) separately confirmed that flat-field `TreeMap[str, DataclassType]` records are readable on the current Bradbury build (a constraint that failed identically in earlier testing). That verification covered flat records; a *nested collection* inside a TreeMap value is a different, untested shape, and was not risked here for the same reason it was not adopted in that sibling project's own storage.
+- **`DynArray()` cannot be constructed directly** — its own `__init__` exists specifically to raise `TypeError("this class can't be instantiated by user")`, unlike `TreeMap()`. `program_ids` is therefore a bare annotation with no explicit assignment in `__init__`. This was caught immediately by this contract's own test suite the one time it was tried the other way (see §9).
+
+## 8. Threat model
+
+- **Prompt injection via observed state.** A target contract's own stored data may include arbitrary text the grantee or any other party has written to it. The verification prompt includes an explicit security notice instructing the model to treat that state strictly as data, never as embedded instructions, and to weigh an apparent injection attempt itself as a signal of an untrustworthy source.
+- **State changes without a real, successful read.** A failed or null-returning cross-contract read short-circuits to `INSUFFICIENT_STATE` before any LLM call or fund movement is reachable (see §9 for why "failed" required an extra check beyond exception-catching).
+- **A funder unilaterally reclaiming funds early.** `STALE_TRANCHE_TIMEOUT_SECONDS` is a fixed constant, not caller-configurable, specifically to prevent this.
+- **Authorization.** `register_tranche` and `withdraw_unallocated` are funder-only; `reclaim_stale_tranche` is funder-only (the party who would receive the reclaim); `verify_milestone` is funder-or-grantee-only (both parties have a legitimate reason to trigger it, but an uninvolved third party triggering repeated verification rounds against someone else's program is not a use case this contract needs to support, and gas cost alone already discourages it).
+- **Unbounded cost.** `MAX_MILESTONE_DESCRIPTION_CHARS`, `MAX_VIEW_METHOD_CHARS`, `MAX_VIEW_ARGS`/`MAX_VIEW_ARG_STR_CHARS`, and `MAX_OBSERVED_STATE_CHARS`/`_DEPTH`/`_ITEMS` all bound worst-case prompt size and per-validator LLM cost. Unlike [IndependentCanonicalExtractor](https://github.com/Fortune9thx/independent-canonical-extractor)'s numeric-normalization DoS finding (a tiny attacker string forcing an unboundedly large *computed* output via `decimal.Decimal`), the observed-state value here is an already-fully-materialized object decoded by GenVM's own calldata layer before this contract's code ever touches it — there is no equivalent tiny-input/huge-output amplification step, so the depth/item caps here are ordinary defense-in-depth on an already-finite structure, not a fix for a discovered amplification vector.
+
+## 9. A real bug the test suite caught before deployment
+
+While building the failed-read short-circuit, the original code was:
+
+```python
+try:
+    raw_state = getattr(...)(*view_args)
+    read_ok = True
+except Exception:
+    read_ok = False
+```
+
+A dedicated test (`test_verify_milestone_insufficient_state_on_failed_read_skips_llm`) — deliberately calling `verify_milestone` with no cross-contract mock installed at all — failed: the contract reached `gl.nondet.exec_prompt` anyway, with a prompt containing `"OBSERVED ON-CHAIN STATE: null"`. Tracing the failure showed why: reading the *installed SDK's own source* (`genlayer/gl/_internal/gl_call.py`, not just `gltest`'s mock), `gl_call_generic` returns a `Lazy` resolving to plain `None` when the underlying `gl_call` fails — it does not raise. `try/except` around the read was therefore never triggered by an unmocked/failed call at all.
+
+The fix — checking `raw_state is not None` in addition to the `try/except` — closed this correctly, verified by the same test now passing. The one accepted trade-off, documented directly in the contract's own comments: a target view method whose own genuine, successful return value happens to be a bare `null` cannot be distinguished from a failed read here, and is treated as `INSUFFICIENT_STATE` either way. This was a deliberate call, not an oversight it slipped past — a `null` observation could never by itself justify a confident `SATISFIED` judgment regardless, so no real judgment is lost by short-circuiting it, and the alternative (routing every failed read through an LLM call anyway) would waste gas on a question that isn't actually ambiguous.
+
+This is also why the initial standalone probe test ("does an unmocked cross-contract call raise?") gave a false-positive pass earlier in development: it used a `try: ...; assert False, "expected an error"; except Exception: pass` pattern, and the `assert False` itself was an `AssertionError` — an `Exception` subclass — silently caught by its own `except Exception` clause. The probe "passed" while actually proving nothing. The real test suite's semantic assertions (checking `verification["outcome"]` directly, never wrapping the call itself in a masking try/except) caught what the probe missed.
+
+## 9a. A second real finding, from the live Bradbury deployment itself: querying a not-yet-finalized target is a hard VM fault, not a soft one
+
+The mocked-test finding above (§9) covers a *gracefully failed* read (target/method genuinely absent). Live deployment surfaced a different, more severe failure mode: calling `verify_milestone` against a target contract whose own deploy transaction had reached `ACCEPTED` but not yet `FINALIZED` produced a `VM_ERROR` (`result_code: 2`, decoding to `invalid_contract absent_runner_comment`) that reverted the entire transaction — `genvm_log` showed `llm_module: {calls: 0}`, confirming the fault occurred *before* any of `verify_milestone`'s own Python code downstream of the read (including its `except` clause) ever executed. `try/except` cannot catch this, because it isn't a Python-level exception at all — it is the VM refusing to resolve `LATEST_FINAL` state for a contract that doesn't have any finalized state yet.
+
+Waiting for the identical target deploy to reach genuine `FINALIZED` (roughly 25 minutes on Bradbury) and retrying the identical `verify_milestone` call, with no code changes, succeeded cleanly — correct observed state, correct LLM judgment. This is an operational timing constraint for integrators, not a contract defect: **a funder or grantee should wait for a target contract's relevant state-changing transaction to reach `FINALIZED` (not merely `ACCEPTED`) before triggering `verify_milestone` against it.** Triggering too early costs gas on a reverted transaction rather than gracefully recording `INSUFFICIENT_STATE`, precisely because the failure happens beneath the layer this contract's own error handling operates at.
+
+## 10. Known, honestly-documented limitations
+
+- **`view_args` supports only JSON primitives (strings, integers, booleans) — not `Address`-typed or nested-structure target-method parameters.** Whether GenVM's calldata layer performs automatic type coercion from a plain decoded JSON value into an `Address`-typed (or other precisely-typed) target parameter was not verified, and this contract does not claim it works. Funders registering a tranche should choose target view methods whose parameters (if any) accept plain strings/integers/booleans, or no parameters at all.
+- **A `null`-returning successful view call is indistinguishable from a failed read** (§9) — both resolve to `INSUFFICIENT_STATE` without an LLM call. Funders should choose milestone view methods that return a clear positive signal (a status string, a count, a boolean) rather than relying on the *absence* of a value to mean success.
+- **`gl.eq_principle.strict_eq`'s validator path cannot be exercised in `gltest` direct-mode tests** (a known gap in this account's testing history, unrelated to this contract specifically) — `strict_eq`'s validator calls `gl.vm.spawn_sandbox`, which direct-mode does not mock, raising `ModuleNotFoundError: cloudpickle` if attempted. `strict_eq`'s real behavior is read directly from the installed SDK source (§2), not inferred from what could be exercised in tests; the test suite instead covers `leader_fn`'s and the deterministic read's full logic exhaustively.
+- **Independent re-execution cannot compensate for a target contract whose state is itself still evolving relative to the milestone's intent.** If a grantee's milestone genuinely requires ongoing state (not a one-time completion flag), repeated re-triggering of `verify_milestone` is the intended mechanism (§ "What it does" in README) — this is a feature of the design, not a limitation, but worth being explicit that a single verification call is a snapshot, not a standing guarantee.
+- **`verify_milestone` must be triggered only after the target's relevant state has reached `FINALIZED`, not merely `ACCEPTED`** (§9a) — confirmed live, not theoretical: querying `LATEST_FINAL` state too early is a VM-level fault that reverts the whole transaction (costing gas) rather than gracefully producing `INSUFFICIENT_STATE`, because the fault occurs beneath the layer this contract's own error handling can reach. This is an operational sequencing constraint for funders/grantees to be aware of, not a code defect.
+
+## 11. Integration guide
+
+See [README.md](../README.md#integration-example) and [`examples/deployment_status_target.py`](../examples/deployment_status_target.py) for a worked example: a minimal target contract exposing one view method, and the exact `register_tranche` call that gates a tranche on it. In general: any already-deployed GenVM contract with a `@gl.public.view` method returning a plain-primitive or shallow-structured value can be a verification target — no coordination with that contract's own author is required beyond knowing its address and the view method's name.
