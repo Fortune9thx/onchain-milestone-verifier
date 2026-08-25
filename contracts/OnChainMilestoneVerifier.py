@@ -79,7 +79,7 @@ JSON-decoded primitives to those richer calldata types. This is a real
 scope limit, not a claim that every possible view method is reachable.
 
 ## Why re-verification requires the target's observed state to actually
-## change, and why attempts are hard-capped per tranche
+## change, and why attempts are rate-limited by a cooldown, not a fixed count
 
 `verify_milestone` is re-triggerable on a PENDING tranche, and its
 judgment is an LLM call -- `gl.eq_principle.strict_eq` requires every
@@ -94,22 +94,36 @@ support -- an asymmetric bet (small bounded cost, full tranche amount as
 the payoff) that a strict reviewer must treat as a live fund-drain path,
 not a hypothetical one.
 
-Two independent gates close this: (1) each tranche stores a
+Two independent gates close this. (1) Each tranche stores a
 `last_verification_marker` -- a hash of the deterministically-observed
 state from its most recent verification attempt (or a fixed sentinel if
 that attempt's read failed) -- and a fresh attempt whose newly-observed
-marker is unchanged from the stored one is rejected before the
-non-deterministic judgment (or any storage write) ever runs. (2) because a
-target contract's operator could otherwise defeat gate (1) by trivially
-oscillating its own state between a couple of values every call, total
-attempts per tranche are hard-capped at `MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE`
-regardless of whether each individual attempt's state technically differed
-from the last. Once exhausted without a SATISFIED outcome, the tranche can
-no longer be re-verified at all -- only reclaimed by the funder via
-`reclaim_stale_tranche` once the stale timeout elapses. This bounds the
-worst-case number of independent judgment rounds any single tranche can
-ever be exposed to, which is the only lever available against a
-draw-until-lucky attack on a genuinely non-deterministic judgment.
+marker is unchanged from the stored one is rejected immediately, before
+any cross-contract read, non-deterministic judgment, or storage write.
+(2) Consecutive attempts on the same tranche must be spaced at least
+`MIN_VERIFICATION_INTERVAL_SECONDS` apart, checked against
+`last_attempt_at` before anything else in the method runs.
+
+A fixed *count* cap (rather than a cooldown) was tried first and
+deliberately reverted: it closed the farming path but opened a worse one
+in its place -- a bad-faith funder, equally entitled to call
+`verify_milestone`, could burn through a small shared attempt budget on
+genuinely honest, early, not-yet-satisfied readings (a percent-complete
+counter climbing through several real states, none of them final) before
+the grantee ever got a chance to prove genuine completion, then simply
+wait out `reclaim_stale_tranche`'s timeout to take back funds for a
+milestone that really was met on-chain. A cooldown has no such ceiling:
+however many honest check-ins have already happened, a tranche can always
+eventually get one more, correct one once real progress occurs --
+`STALE_TRANCHE_TIMEOUT_SECONDS` remains the only outer bound on how long
+this can all take, exactly as it already was for every other path in this
+contract, rather than a second, smaller, exploitable one bolted on top of
+it. The trade-off this accepts: a determined attacker with weeks to spend
+could still, in principle, eventually land a lucky false-positive round,
+same as before -- but slowly, visibly (each attempt is a public
+transaction against a fixed timestamp gap), and at meaningfully higher
+real cost than the original zero-cooldown design, which is the realistic
+bar for a probabilistic judgment oracle rather than an unreachable one.
 
 ## Why funds only move through a rigid, bounded outcome
 
@@ -168,6 +182,15 @@ occur. A failed EOA transfer is not auto-refunded by GenVM (documented
 platform behavior, not a bug); this is an accepted trade-off, consistent
 with other payout-bearing contracts in this account's history.
 
+`retry_release` exists for exactly that trade-off's failure case -- a
+RELEASED tranche whose transfer never arrived -- but is itself capped at
+`MAX_RELEASE_RETRIES` (see the method's own docstring for why an
+uncapped retry is a *worse* bug than the one it fixes: every other fund-
+moving path in this contract mutates state specifically to block
+re-entry, and an uncapped retry would be the one exception, callable
+indefinitely against this contract's single pooled GEN balance rather
+than any one tranche's own allocation).
+
 `reclaim_stale_tranche` exists so a tranche whose milestone can genuinely
 never be satisfied (an abandoned grant) does not lock its escrowed funds
 forever: after `STALE_TRANCHE_TIMEOUT_SECONDS` with no successful
@@ -220,13 +243,23 @@ MAX_OBSERVED_STATE_NODES = 2000
 
 STALE_TRANCHE_TIMEOUT_SECONDS = 90 * 24 * 3600  # 90 days
 
-# Hard cap on verify_milestone attempts per tranche, regardless of whether
-# each attempt's observed state technically differed from the last (see
-# module docstring: closes the "oscillate the state to bypass the
-# unchanged-state gate" loophole). Once exhausted without a SATISFIED
-# outcome, the tranche can never be re-verified -- only reclaimed by the
-# funder via reclaim_stale_tranche after the stale timeout.
-MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE = 5
+# Minimum real elapsed time required between consecutive verify_milestone
+# attempts on the same tranche, regardless of whether the freshly-observed
+# state happened to differ from the last attempt (see module docstring for
+# why this replaced an earlier fixed-count cap: a count can be exhausted
+# permanently by a bad-faith funder on early, honest, not-yet-satisfied
+# readings; a cooldown cannot, since a tranche can always eventually get
+# one more, correct check once real progress happens).
+MIN_VERIFICATION_INTERVAL_SECONDS = 24 * 3600  # 24 hours
+
+# Hard cap on how many times retry_release may re-issue a RELEASED
+# tranche's transfer. Unlike verify_milestone, this method has no
+# accompanying state change that would otherwise prevent re-entry, and it
+# draws from this contract's single pooled GEN balance rather than any
+# one tranche's own allocation -- an uncapped retry_release would be a
+# standing, repeatable drain on every program's escrow, not just the
+# tranche it was called against. See retry_release's own docstring.
+MAX_RELEASE_RETRIES = 1
 
 ALLOWED_OUTCOMES = ("SATISFIED", "NOT_SATISFIED", "INSUFFICIENT_STATE")
 
@@ -428,6 +461,8 @@ class OnChainMilestoneVerifier(gl.Contract):
             "status": "PENDING",
             "verification_count": 0,
             "last_verification_marker": "",
+            "last_attempt_at": "",
+            "release_retry_count": 0,
             "created_at": created_at,
         }
         self.tranches[tranche_id] = json.dumps(record, sort_keys=True)
@@ -465,6 +500,23 @@ class OnChainMilestoneVerifier(gl.Contract):
             )
         if tranche["status"] != "PENDING":
             raise gl.vm.UserError(f"tranche is not PENDING: {tranche_id!r}")
+
+        # Cooldown gate (see module docstring for why this, not a fixed
+        # attempt count, is what bounds re-verification rate): checked
+        # first, before any cross-contract read, so a too-soon call costs
+        # only this comparison, not even the deterministic read's gas.
+        # `last_attempt_at` starts as "" (set in register_tranche), so a
+        # tranche's first-ever attempt is never gated by this check.
+        last_attempt_at = tranche.get("last_attempt_at", "")
+        if last_attempt_at:
+            elapsed_since_last_attempt = _seconds_since(last_attempt_at)
+            if elapsed_since_last_attempt < MIN_VERIFICATION_INTERVAL_SECONDS:
+                raise gl.vm.UserError(
+                    f"must wait at least {MIN_VERIFICATION_INTERVAL_SECONDS}s "
+                    f"between verification attempts on this tranche (elapsed "
+                    f"{elapsed_since_last_attempt}s) -- prevents rapid "
+                    f"re-rolling of a stochastic judgment"
+                )
 
         milestone_description = tranche["milestone_description"]
         target_contract = tranche["target_contract"]
@@ -531,37 +583,26 @@ class OnChainMilestoneVerifier(gl.Contract):
             marker = "READ_FAILED"
 
         # -----------------------------------------------------------------
-        # Anti-farming gates (see module docstring). Both checked, and both
-        # can raise, BEFORE any storage write or non-deterministic call --
-        # a rejected attempt costs the caller only the gas for the
-        # deterministic read above, never an LLM call or a permanent
-        # storage entry.
-        #
-        # Gate 1: the deterministically-observed state must have actually
-        # changed since this tranche's last verification attempt.
-        # `last_verification_marker` starts as "" (set in register_tranche)
-        # which never collides with a real sha256 hexdigest or the
-        # "READ_FAILED" sentinel, so a tranche's first-ever attempt always
-        # passes this gate regardless of outcome.
+        # Anti-farming gate (see module docstring, and the cooldown gate
+        # above): the deterministically-observed state must have actually
+        # changed since this tranche's last verification attempt, checked
+        # and raised BEFORE any storage write or non-deterministic call --
+        # a rejected attempt costs the caller only the gas already spent
+        # on the deterministic read above, never an LLM call or a
+        # permanent storage entry. `last_verification_marker` starts as ""
+        # (set in register_tranche) which never collides with a real
+        # sha256 hexdigest or the "READ_FAILED" sentinel, so a tranche's
+        # first-ever attempt always passes this gate regardless of outcome.
+        # This gate alone is not airtight (a target contract's own return
+        # value can vary for reasons unrelated to the milestone, e.g. an
+        # embedded call counter), which is exactly why the cooldown gate
+        # above -- not this one -- is the mechanism that actually bounds
+        # how fast a stochastic judgment can be re-rolled.
         if marker == tranche["last_verification_marker"]:
             raise gl.vm.UserError(
                 "target contract state has not changed since the last "
                 "verification attempt on this tranche -- wait for genuine "
                 "on-chain progress before re-triggering verification"
-            )
-
-        # Gate 2: a hard cap on total attempts, independent of gate 1 --
-        # closes the loophole where a target contract's operator trivially
-        # oscillates its own state between a couple of values purely to
-        # keep defeating gate 1 and buy unlimited additional judgment
-        # rounds.
-        if int(tranche["verification_count"]) >= MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE:
-            raise gl.vm.UserError(
-                f"tranche has reached the maximum of "
-                f"{MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE} verification "
-                f"attempts without a SATISFIED outcome; the funder may "
-                f"reclaim it via reclaim_stale_tranche once the stale "
-                f"timeout elapses"
             )
 
         if read_ok:
@@ -619,6 +660,7 @@ class OnChainMilestoneVerifier(gl.Contract):
 
         tranche["verification_count"] = int(tranche["verification_count"]) + 1
         tranche["last_verification_marker"] = marker
+        tranche["last_attempt_at"] = verified_at
 
         if outcome == "SATISFIED":
             tranche["status"] = "RELEASED"
@@ -666,14 +708,12 @@ class OnChainMilestoneVerifier(gl.Contract):
     # -----------------------------------------------------------------
     @gl.public.write
     def retry_release(self, tranche_id: str) -> None:
-        """Re-issues the GEN transfer for an already-RELEASED tranche.
-        GenVM's `emit_transfer` is an asynchronous, fire-and-forget
-        message with no on-chain delivery confirmation this contract can
-        observe -- so a RELEASED tranche's accounting reflects that a
-        transfer was *authorized and sent*, not a proof that it *arrived*.
-        Funder-or-grantee-callable, and does not change any accounting
-        (the tranche's amount was already recorded as released the moment
-        `verify_milestone` first flipped it to RELEASED).
+        """Re-issues the GEN transfer for an already-RELEASED tranche, up
+        to `MAX_RELEASE_RETRIES` times total. GenVM's `emit_transfer` is
+        an asynchronous, fire-and-forget message with no on-chain
+        delivery confirmation this contract can observe -- so a RELEASED
+        tranche's accounting reflects that a transfer was *authorized and
+        sent*, not a proof that it *arrived*. Funder-or-grantee-callable.
 
         This is a manual reconciliation tool, not an automatic retry:
         the caller is responsible for confirming off-chain (e.g. by
@@ -682,6 +722,20 @@ class OnChainMilestoneVerifier(gl.Contract):
         transfer that did succeed sends a real, duplicate payment -- that
         residual risk is unavoidable given GenVM exposes no delivery
         receipt to contract code, and is accepted here rather than hidden.
+
+        The retry count is capped and tracked in storage (`tranche`'s own
+        `release_retry_count` field, incremented before the transfer is
+        attempted) because this is the one fund-moving method in this
+        contract whose retry path has no OTHER accompanying state change
+        to prevent repeated re-entry: `verify_milestone`'s SATISFIED
+        branch flips `status` to RELEASED, blocking itself from ever
+        running again on the same tranche; `withdraw_unallocated`
+        deducts from `total_escrowed` until nothing is left to withdraw.
+        An uncapped `retry_release` would be the one exception -- callable
+        indefinitely, against this contract's single pooled GEN balance
+        shared by every program, not just the tranche it was called
+        against -- which would make it a far more serious bug than the
+        one it exists to fix.
         """
         tranche = self._get_tranche(tranche_id)
         program = self._get_program(tranche["program_id"])
@@ -693,6 +747,17 @@ class OnChainMilestoneVerifier(gl.Contract):
             )
         if tranche["status"] != "RELEASED":
             raise gl.vm.UserError(f"tranche is not RELEASED: {tranche_id!r}")
+
+        retry_count = int(tranche.get("release_retry_count", 0))
+        if retry_count >= MAX_RELEASE_RETRIES:
+            raise gl.vm.UserError(
+                f"tranche has already been retried the maximum of "
+                f"{MAX_RELEASE_RETRIES} time(s); no further retries are "
+                f"permitted"
+            )
+
+        tranche["release_retry_count"] = retry_count + 1
+        self.tranches[tranche_id] = json.dumps(tranche, sort_keys=True)
 
         gl.get_contract_at(Address(program["grantee"])).emit_transfer(
             value=u256(int(tranche["amount"]))

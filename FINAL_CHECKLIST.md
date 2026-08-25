@@ -54,7 +54,20 @@
 - [x] Repository link added to `PORTAL_SUBMISSION.md`
 - [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
 
-## Post-fix redeploy (current)
+## Post-fix redeploy, round 2 (current)
+
+A third adversarial review pass found that two of round 1's own fixes (below) had traded one real problem for another: an uncapped `retry_release` (a genuine pooled-balance drain — critical) and a fixed verification-attempt cap (a way for a bad-faith funder to permanently deny a grantee who actually finishes — high). Both fixed. See `CHANGELOG.md`'s `[1.2.0]` entry and `docs/DESIGN.md` §13 for the full account.
+
+- [x] Fixes applied; test suite grew 42 → 44 (2 obsolete tests removed, 5 added), all passing; `genvm-lint check`/`validate` both clean on the fixed source
+- [x] Redeployed to GenLayer Testnet Bradbury: `0x5b20f2833D1BCad3830eb08C40559AA57B0a7D0f`, deploy tx `0xb09cd5aacae84b197b26eb8ecdf706c1cd1ea26f30e048cd404a0ef78a3dd451`
+- [x] Post-deploy read verified (`get_program_count() == 0`)
+- [x] Deploy transaction reached genuine `FINALIZED` status, confirmed `AGREE`/`FINISHED_WITH_RETURN` (5/5 validators agreed)
+- [x] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new address
+- [x] Pushed to GitHub
+
+The 1.1.0 deployment (`0xDe1817Aa376Dc25cC2dF36a0738a615E1B215836`) is superseded pending the above — it still runs the exploitable `retry_release`/fixed-attempt-cap logic. No live financial exposure identified at time of writing (no tranche on that deployment has ever reached `RELEASED`, so `retry_release`'s drain path has never been reachable there; no tranche has come close to exhausting the fixed attempt cap either).
+
+## Post-fix redeploy, round 1
 
 A maximally adversarial post-launch review found and fixed five real issues (one critical) in `contracts/OnChainMilestoneVerifier.py`, including a genuine fund-drain path (unlimited free re-verification against a stochastic LLM judgment). See `CHANGELOG.md`'s `[1.1.0]` entry and `docs/DESIGN.md` §12 for the full account.
 

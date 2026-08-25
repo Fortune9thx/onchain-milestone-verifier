@@ -308,12 +308,14 @@ def test_verify_milestone_not_satisfied_no_release(direct_deploy, direct_vm):
 
 def test_verify_milestone_can_be_retriggered_after_not_satisfied(direct_deploy, direct_vm):
     contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    warp_with_message(direct_vm, "2026-01-01T00:00:00Z")
     _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
 
     _mock_state_read(direct_vm, "IN_PROGRESS")
     direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
     first_id = contract.verify_milestone(tranche_id)
 
+    warp_with_message(direct_vm, "2026-01-02T00:01:00Z")  # past the cooldown
     direct_vm.clear_mocks()
     _mock_state_read(direct_vm, "DONE")
     direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
@@ -328,12 +330,16 @@ def test_verify_milestone_can_be_retriggered_after_not_satisfied(direct_deploy, 
 
 def test_verify_milestone_rejects_repeat_attempt_with_unchanged_state(direct_deploy, direct_vm):
     contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    warp_with_message(direct_vm, "2026-01-01T00:00:00Z")
     _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
 
     _mock_state_read(direct_vm, "IN_PROGRESS")
     direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
     contract.verify_milestone(tranche_id)
 
+    # Past the cooldown, so this reaches the state-unchanged gate rather
+    # than being rejected by the cooldown gate first.
+    warp_with_message(direct_vm, "2026-01-02T00:01:00Z")
     # Same target state as before -> rejected before any LLM call or write,
     # even though a fresh (unused) LLM mock is still registered.
     direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
@@ -348,39 +354,66 @@ def test_verify_milestone_rejects_repeat_attempt_with_unchanged_state(direct_dep
     ]
 
 
-def test_verify_milestone_rejects_after_max_attempts_reached(direct_deploy, direct_vm):
+def test_verify_milestone_rejects_too_soon_repeat_attempt(direct_deploy, direct_vm):
+    """Even with genuinely different observed state, a second attempt
+    inside the cooldown window is rejected -- the cooldown, not a fixed
+    attempt count, is what actually bounds re-verification rate (see
+    docs/DESIGN.md #12 for why a fixed count was tried and reverted)."""
     contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
-    mod = _module()
+    warp_with_message(direct_vm, "2026-01-01T00:00:00Z")
     _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
 
-    for i in range(mod.MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE):
-        direct_vm.clear_mocks()
-        _mock_state_read(direct_vm, f"STATE-{i}")
-        direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    _mock_state_read(direct_vm, "STATE-A")
+    direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    warp_with_message(direct_vm, "2026-01-01T00:00:10Z")  # 10s later, well inside the cooldown
+    direct_vm.clear_mocks()
+    _mock_state_read(direct_vm, "STATE-B")  # genuinely different state
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    with direct_vm.expect_revert("must wait at least"):
         contract.verify_milestone(tranche_id)
 
     tranche = json.loads(contract.get_tranche(tranche_id))
-    assert tranche["verification_count"] == mod.MAX_VERIFICATION_ATTEMPTS_PER_TRANCHE
+    assert tranche["status"] == "PENDING"
+    assert tranche["verification_count"] == 1
 
+
+def test_verify_milestone_allows_repeat_attempt_after_cooldown_elapses(direct_deploy, direct_vm):
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    warp_with_message(direct_vm, "2026-01-01T00:00:00Z")
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+
+    _mock_state_read(direct_vm, "STATE-A")
+    direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    warp_with_message(direct_vm, "2026-01-02T00:01:00Z")  # past the cooldown
     direct_vm.clear_mocks()
-    _mock_state_read(direct_vm, "STATE-final-and-different")
+    _mock_state_read(direct_vm, "STATE-B")
     direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
-    with direct_vm.expect_revert("maximum"):
-        contract.verify_milestone(tranche_id)
+    contract.verify_milestone(tranche_id)
+
+    tranche = json.loads(contract.get_tranche(tranche_id))
+    assert tranche["status"] == "RELEASED"
+    assert tranche["verification_count"] == 2
 
 
 def test_verify_milestone_can_be_retriggered_when_state_genuinely_changes_after_failure(
     direct_deploy, direct_vm
 ):
     """Distinct from the unchanged-state rejection above: a genuinely
-    different observed state each time must keep working, up to the cap."""
+    different observed state each time must keep working, once the
+    cooldown has elapsed."""
     contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    warp_with_message(direct_vm, "2026-01-01T00:00:00Z")
     _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
 
     _mock_state_read(direct_vm, "IN_PROGRESS")
     direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
     first_id = contract.verify_milestone(tranche_id)
 
+    warp_with_message(direct_vm, "2026-01-02T00:01:00Z")  # past the cooldown
     direct_vm.clear_mocks()
     _mock_state_read(direct_vm, "STILL_IN_PROGRESS")
     direct_vm.mock_llm(r".", '{"outcome": "NOT_SATISFIED"}')
@@ -498,6 +531,27 @@ def test_retry_release_happy_path(direct_deploy, direct_vm):
     contract.retry_release(tranche_id)
     tranche = json.loads(contract.get_tranche(tranche_id))
     assert tranche["status"] == "RELEASED"
+    assert tranche["release_retry_count"] == 1
+
+
+def test_retry_release_rejects_after_max_retries(direct_deploy, direct_vm):
+    """retry_release has no accompanying state change to prevent re-entry
+    on its own -- unlike verify_milestone or withdraw_unallocated -- and
+    draws from this contract's single pooled GEN balance, not just this
+    tranche's allocation. An uncapped retry would be a standing drain on
+    every program's escrow; MAX_RELEASE_RETRIES bounds it."""
+    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
+    mod = _module()
+    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
+    _mock_state_read(direct_vm, "DONE")
+    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
+    contract.verify_milestone(tranche_id)
+
+    for _ in range(mod.MAX_RELEASE_RETRIES):
+        contract.retry_release(tranche_id)
+
+    with direct_vm.expect_revert("maximum"):
+        contract.retry_release(tranche_id)
 
 
 def test_retry_release_rejects_when_not_released(direct_deploy, direct_vm):
