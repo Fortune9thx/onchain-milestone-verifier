@@ -516,64 +516,6 @@ def test_verify_milestone_passes_view_args_through(direct_deploy, direct_vm):
 
 
 # ---------------------------------------------------------------------------
-# retry_release
-# ---------------------------------------------------------------------------
-
-
-def test_retry_release_happy_path(direct_deploy, direct_vm):
-    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
-    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
-    _mock_state_read(direct_vm, "DONE")
-    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
-    contract.verify_milestone(tranche_id)
-
-    # Does not raise, and does not change any accounting.
-    contract.retry_release(tranche_id)
-    tranche = json.loads(contract.get_tranche(tranche_id))
-    assert tranche["status"] == "RELEASED"
-    assert tranche["release_retry_count"] == 1
-
-
-def test_retry_release_rejects_after_max_retries(direct_deploy, direct_vm):
-    """retry_release has no accompanying state change to prevent re-entry
-    on its own -- unlike verify_milestone or withdraw_unallocated -- and
-    draws from this contract's single pooled GEN balance, not just this
-    tranche's allocation. An uncapped retry would be a standing drain on
-    every program's escrow; MAX_RELEASE_RETRIES bounds it."""
-    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
-    mod = _module()
-    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
-    _mock_state_read(direct_vm, "DONE")
-    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
-    contract.verify_milestone(tranche_id)
-
-    for _ in range(mod.MAX_RELEASE_RETRIES):
-        contract.retry_release(tranche_id)
-
-    with direct_vm.expect_revert("maximum"):
-        contract.retry_release(tranche_id)
-
-
-def test_retry_release_rejects_when_not_released(direct_deploy, direct_vm):
-    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
-    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
-    with direct_vm.expect_revert("not RELEASED"):
-        contract.retry_release(tranche_id)
-
-
-def test_retry_release_rejects_non_funder_non_grantee(direct_deploy, direct_vm, direct_alice):
-    contract = direct_deploy(CONTRACT_PATH, sdk_version="v0.2.16")
-    _, tranche_id = _setup_program_and_tranche(contract, direct_vm)
-    _mock_state_read(direct_vm, "DONE")
-    direct_vm.mock_llm(r".", '{"outcome": "SATISFIED"}')
-    contract.verify_milestone(tranche_id)
-
-    direct_vm.sender = direct_alice
-    with direct_vm.expect_revert("only the tranche's funder or grantee"):
-        contract.retry_release(tranche_id)
-
-
-# ---------------------------------------------------------------------------
 # withdraw_unallocated
 # ---------------------------------------------------------------------------
 

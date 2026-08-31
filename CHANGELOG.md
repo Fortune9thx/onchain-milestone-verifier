@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.3.0] - 2026-08-26
+
+A real GenLayer Portal steward review flagged that 1.2.0's `retry_release` was still not safe, despite surviving three rounds of this project's own adversarial self-review. The steward's finding: capping the retry count bounds the *number* of duplicate payments a bad-faith caller could get, but does nothing to prevent the *first* retry from being an unconditional duplicate — nothing on-chain distinguishes "the original transfer genuinely failed" from "it succeeded and someone is retrying anyway" (GenVM gives contract code no delivery confirmation for `emit_transfer`), and because this contract pools every program's GEN in one shared balance, that guaranteed duplicate payment could draw on funds belonging to an entirely different program.
+
+- **Critical, fixed by removal:** `retry_release` is removed entirely. A capped retry is still an *unsafe* retry when nothing can verify the precondition for calling it — the cap only bounds the blast radius, it doesn't close the hole. There is no on-chain signal this contract could check to gate a retry safely, so any retry path is either unconditional (unsafe) or requires information the contract fundamentally cannot obtain from GenVM. Removing the method returns this contract to the same accepted trade-off already used by every other payout-bearing contract in this account's history: a failed async transfer is not auto-recoverable on-chain, documented as a known limitation rather than papered over with a mechanism that introduces a worse, guaranteed problem.
+- Test suite: 44 → 40 (4 `retry_release` tests removed, none needed elsewhere); `genvm-lint check`/`validate` both clean; method count 14 → 13 (6 write → 5 write).
+- This is the first fix in this project's history driven by an external review rather than self-review — see `docs/DESIGN.md` §14 for the full account, including why this specific finding survived three internal adversarial passes.
+
 ## [1.2.0] - 2026-08-25
 
 A second maximally adversarial review, run the same way as the one that produced 1.1.0 (source code only, no design docs consulted), found that two of 1.1.0's own fixes had traded one real problem for another. Both are fixed here; the second is the more serious of the two.

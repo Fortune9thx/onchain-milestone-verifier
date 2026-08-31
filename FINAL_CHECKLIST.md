@@ -54,7 +54,21 @@
 - [x] Repository link added to `PORTAL_SUBMISSION.md`
 - [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
 
-## Post-fix redeploy, round 2 (current)
+## Steward-requested fix, round 3 (current)
+
+A real GenLayer Portal steward review of v1.2.0 flagged that `retry_release` was still not safe: "either party can send the full tranche a second time without proving the first transfer failed, and that extra payment can consume escrow held for other programs." Correct -- round 2's cap (`MAX_RELEASE_RETRIES = 1`) bounded the *number* of guaranteed duplicate payments but did not prevent the *first* one, since GenVM gives contract code no way to verify the retry's own precondition. `retry_release` is removed entirely rather than redesigned, since no on-chain signal exists that could gate it safely. This is the first fix in this project's history driven by external review rather than self-review -- our own three prior adversarial passes did not catch this. See `CHANGELOG.md`'s `[1.3.0]` entry and `docs/DESIGN.md` §14 for the full account.
+
+- [x] Fix applied (method removed, along with `MAX_RELEASE_RETRIES` and `release_retry_count`); test suite 44 → 40 (4 obsolete tests removed), all passing; `genvm-lint check`/`validate` both clean on the fixed source
+- [x] Redeployed to GenLayer Testnet Bradbury: `0x46Bc691A9B79670ee5137585641fc455aA830961`, deploy tx `0xb0ead77e9a2513da799460be4eb26ad4e33567b99a6d3ca1619daf54e629cbb6`
+- [x] Post-deploy read verified (`get_program_count() == 0`)
+- [x] Deploy transaction reached genuine `FINALIZED` status, confirmed `AGREE`/`FINISHED_WITH_RETURN`
+- [x] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new address
+- [x] Pushed to GitHub
+- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository and deployed source
+
+The v1.2.0 deployment (`0x5b20f2833D1BCad3830eb08C40559AA57B0a7D0f`) is superseded pending the above -- it still runs the unsafe capped `retry_release`. No live financial exposure identified at time of writing (no tranche on that deployment has ever reached `RELEASED`, so the guaranteed-duplicate-payment path has never actually been reachable there).
+
+## Post-fix redeploy, round 2
 
 A third adversarial review pass found that two of round 1's own fixes (below) had traded one real problem for another: an uncapped `retry_release` (a genuine pooled-balance drain — critical) and a fixed verification-attempt cap (a way for a bad-faith funder to permanently deny a grantee who actually finishes — high). Both fixed. See `CHANGELOG.md`'s `[1.2.0]` entry and `docs/DESIGN.md` §13 for the full account.
 

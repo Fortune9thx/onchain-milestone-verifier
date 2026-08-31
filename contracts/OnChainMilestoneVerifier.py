@@ -182,14 +182,26 @@ occur. A failed EOA transfer is not auto-refunded by GenVM (documented
 platform behavior, not a bug); this is an accepted trade-off, consistent
 with other payout-bearing contracts in this account's history.
 
-`retry_release` exists for exactly that trade-off's failure case -- a
-RELEASED tranche whose transfer never arrived -- but is itself capped at
-`MAX_RELEASE_RETRIES` (see the method's own docstring for why an
-uncapped retry is a *worse* bug than the one it fixes: every other fund-
-moving path in this contract mutates state specifically to block
-re-entry, and an uncapped retry would be the one exception, callable
-indefinitely against this contract's single pooled GEN balance rather
-than any one tranche's own allocation).
+This contract deliberately has NO retry mechanism for a RELEASED
+tranche's transfer. An earlier revision added one (`retry_release`,
+capped at a small fixed retry count) as a reconciliation tool for
+exactly the failure case above -- but a real GenLayer Portal reviewer
+correctly identified that a fixed cap does not make a retry *safe*, only
+*bounded*: nothing on-chain can distinguish "the first transfer
+genuinely failed" from "the first transfer succeeded and someone is
+just calling retry anyway," so even a single permitted retry is a
+guaranteed, unconditional duplicate payment whenever the first transfer
+actually succeeded -- and since this contract pools every program's GEN
+in one shared balance, that duplicate payment draws on funds that may
+belong to an entirely different program. There is no on-chain signal
+this contract could check to gate a retry safely, because GenVM gives
+contract code no delivery confirmation for `emit_transfer` at all; any
+retry path is therefore either unconditional (unsafe, as above) or
+requires information the contract fundamentally cannot obtain. Removing
+the path entirely -- returning to the same accepted trade-off already
+used by every other payout-bearing contract in this account's history --
+is the only response that closes this without introducing a new,
+narrower version of the same problem.
 
 `reclaim_stale_tranche` exists so a tranche whose milestone can genuinely
 never be satisfied (an abandoned grant) does not lock its escrowed funds
@@ -251,15 +263,6 @@ STALE_TRANCHE_TIMEOUT_SECONDS = 90 * 24 * 3600  # 90 days
 # readings; a cooldown cannot, since a tranche can always eventually get
 # one more, correct check once real progress happens).
 MIN_VERIFICATION_INTERVAL_SECONDS = 24 * 3600  # 24 hours
-
-# Hard cap on how many times retry_release may re-issue a RELEASED
-# tranche's transfer. Unlike verify_milestone, this method has no
-# accompanying state change that would otherwise prevent re-entry, and it
-# draws from this contract's single pooled GEN balance rather than any
-# one tranche's own allocation -- an uncapped retry_release would be a
-# standing, repeatable drain on every program's escrow, not just the
-# tranche it was called against. See retry_release's own docstring.
-MAX_RELEASE_RETRIES = 1
 
 ALLOWED_OUTCOMES = ("SATISFIED", "NOT_SATISFIED", "INSUFFICIENT_STATE")
 
@@ -462,7 +465,6 @@ class OnChainMilestoneVerifier(gl.Contract):
             "verification_count": 0,
             "last_verification_marker": "",
             "last_attempt_at": "",
-            "release_retry_count": 0,
             "created_at": created_at,
         }
         self.tranches[tranche_id] = json.dumps(record, sort_keys=True)
@@ -700,68 +702,6 @@ class OnChainMilestoneVerifier(gl.Contract):
         self.programs[program_id] = json.dumps(program, sort_keys=True)
 
         gl.get_contract_at(Address(program["funder"])).emit_transfer(value=u256(remaining))
-
-    # -----------------------------------------------------------------
-    # Public write: manual reconciliation escape hatch for a RELEASED
-    # tranche whose original emit_transfer may not have reached the
-    # grantee
-    # -----------------------------------------------------------------
-    @gl.public.write
-    def retry_release(self, tranche_id: str) -> None:
-        """Re-issues the GEN transfer for an already-RELEASED tranche, up
-        to `MAX_RELEASE_RETRIES` times total. GenVM's `emit_transfer` is
-        an asynchronous, fire-and-forget message with no on-chain
-        delivery confirmation this contract can observe -- so a RELEASED
-        tranche's accounting reflects that a transfer was *authorized and
-        sent*, not a proof that it *arrived*. Funder-or-grantee-callable.
-
-        This is a manual reconciliation tool, not an automatic retry:
-        the caller is responsible for confirming off-chain (e.g. by
-        checking the grantee's actual balance) that the original transfer
-        genuinely did not arrive before calling this. Calling it after a
-        transfer that did succeed sends a real, duplicate payment -- that
-        residual risk is unavoidable given GenVM exposes no delivery
-        receipt to contract code, and is accepted here rather than hidden.
-
-        The retry count is capped and tracked in storage (`tranche`'s own
-        `release_retry_count` field, incremented before the transfer is
-        attempted) because this is the one fund-moving method in this
-        contract whose retry path has no OTHER accompanying state change
-        to prevent repeated re-entry: `verify_milestone`'s SATISFIED
-        branch flips `status` to RELEASED, blocking itself from ever
-        running again on the same tranche; `withdraw_unallocated`
-        deducts from `total_escrowed` until nothing is left to withdraw.
-        An uncapped `retry_release` would be the one exception -- callable
-        indefinitely, against this contract's single pooled GEN balance
-        shared by every program, not just the tranche it was called
-        against -- which would make it a far more serious bug than the
-        one it exists to fix.
-        """
-        tranche = self._get_tranche(tranche_id)
-        program = self._get_program(tranche["program_id"])
-
-        sender = str(gl.message.sender_address)
-        if sender not in (program["funder"], program["grantee"]):
-            raise gl.vm.UserError(
-                "only the tranche's funder or grantee may retry its release"
-            )
-        if tranche["status"] != "RELEASED":
-            raise gl.vm.UserError(f"tranche is not RELEASED: {tranche_id!r}")
-
-        retry_count = int(tranche.get("release_retry_count", 0))
-        if retry_count >= MAX_RELEASE_RETRIES:
-            raise gl.vm.UserError(
-                f"tranche has already been retried the maximum of "
-                f"{MAX_RELEASE_RETRIES} time(s); no further retries are "
-                f"permitted"
-            )
-
-        tranche["release_retry_count"] = retry_count + 1
-        self.tranches[tranche_id] = json.dumps(tranche, sort_keys=True)
-
-        gl.get_contract_at(Address(program["grantee"])).emit_transfer(
-            value=u256(int(tranche["amount"]))
-        )
 
     # -----------------------------------------------------------------
     # Public write: funder reclaims a tranche whose milestone was never
