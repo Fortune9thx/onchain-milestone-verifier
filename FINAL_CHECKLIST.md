@@ -2,13 +2,13 @@
 
 ## Contract design
 
-- [x] Exact two-line file header (`# v0.2.16` / `# { "Depends": ... }`)
+- [x] Exact two-line file header (`# v0.3.0` / `# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }` -- confirmed live-working on Studio Devnet, see `docs/DESIGN.md` §16)
 - [x] Storage: all TreeMaps explicitly initialized in `__init__`; `program_ids` (DynArray) deliberately left as a bare annotation (`DynArray()` forbids direct instantiation — confirmed both by SDK source and by this contract's own test suite catching it)
 - [x] `create_program`, `register_tranche`, `verify_milestone`, `withdraw_unallocated`, `reclaim_stale_tranche` (write) + 8 view methods
 - [x] Exactly one non-deterministic call (`gl.eq_principle.strict_eq`), only in `verify_milestone`; every other write method is fully deterministic
 - [x] `leader_fn` is a named `def`, never a `lambda`
 - [x] Cross-contract read happens in the deterministic body, never inside the nondet block (matches the documented GenVM constraint: `CallContract` inside a nondet closure raises `SystemError: 6`)
-- [x] `.view(state=StorageType.LATEST_FINAL)` used explicitly, not the SDK's `LATEST_NON_FINAL` default — closes a real node-to-node determinism gap
+- [x] `.view(state=StorageView.LATEST_FINALIZED, catch_vm_error=True)` used explicitly, not the SDK's `LATEST_DECIDED` default — closes a real node-to-node determinism gap
 - [x] Rigid three-value bounded outcome (`SATISFIED`/`NOT_SATISFIED`/`INSUFFICIENT_STATE`); `_extract_outcome` fails closed to `NOT_SATISFIED`, never `SATISFIED`
 - [x] A failed OR null-returning cross-contract read short-circuits to `INSUFFICIENT_STATE` with no LLM call — verified this required checking `raw_state is not None`, not just `try/except` (a real bug caught by the test suite, documented in `docs/DESIGN.md` §9)
 - [x] Fund release follows checks-effects-interactions ordering throughout (`verify_milestone`, `withdraw_unallocated`, `reclaim_stale_tranche`)
@@ -19,8 +19,8 @@
 ## Quality bar
 
 - [x] `genvm-lint check` and `genvm-lint validate` both pass with zero warnings
-- [x] Direct-mode tests pass (36/36) — happy paths, authorization, validation, fund-accounting correctness, the deterministic-read-failure short-circuit, and pure-helper unit tests
-- [x] Bradbury dependency pin used (`py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6`), matching this account's other live-verified GenLayer contracts
+- [x] Direct-mode tests pass (41/41) — happy paths, authorization, validation, fund-accounting correctness, the deterministic-read-failure short-circuit, the anti-farming gates (including the marker-truncation regression test), and pure-helper unit tests
+- [x] Studio Devnet v0.3.0 dependency pin used (`py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng`), confirmed correct and current via `genvm-manager#42`
 - [x] Obviously useful, reusable primitive — generic name-based cross-contract dispatch means it's not a bespoke checker for one integration; a worked integration example is included (`examples/deployment_status_target.py`)
 - [x] Screened against a real, external gate framework (`spec-compliance-bounty`'s own `docs/DECISION_RECORD.md`), not just a generic checklist — see `docs/WHY_THIS_PASSES_REVIEW.md`
 - [x] The mechanism this contract depends on (dynamic cross-contract view calls) was empirically validated with a standalone probe *before* the real contract was written, not assumed from reading SDK source alone
@@ -54,7 +54,38 @@
 - [x] Repository link added to `PORTAL_SUBMISSION.md`
 - [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
 
-## Steward-requested fix, round 3 (current)
+## Network migration, round 5 (current) -- Bradbury outage to Studio Devnet
+
+Before the round 4 fix (below) could redeploy to Bradbury, Bradbury's `FeeManager` began reverting on routine fee-quote calls for every deploy/write attempt -- a confirmed, multi-day network outage, corroborated by an identical failure hitting an unrelated project in this account's portfolio in the same window. This account's toolchain had already moved to GenLayer Consensus v0.6 / SDK v0.3.0, which Bradbury's older stack cannot correctly serve. This release migrates to Studio Devnet (`studioDevnet`, chain id `61997`) and ports the contract to the v0.3.0 API. See `CHANGELOG.md`'s `[1.5.0]` entry and `docs/DESIGN.md` §16 for the full account, including every API surface change.
+
+- [x] v0.3.0 API migration applied (no public method signature changes); `genvm-lint check`/`validate` both clean; test suite still 41/41 passing after fixing `gltest` v0.3.0 mock-compatibility gaps
+- [x] CI toolchain pin updated to the matching v0.3.0-era `genlayer-test`/`genvm-linter` release
+- [x] Redeployed to GenLayer Studio Devnet: `0x6892dD5Cdccaa536aA86ba38d14cB99F2FFE50AA`
+- [x] Post-deploy read verified (`get_program_count()`/`list_program_ids()` readable immediately after deploy)
+- [x] `create_program` and `register_tranche` verified live with real GEN (2 GEN escrowed, 1 GEN tranche registered against a redeployed `DeploymentStatusTarget` at `0xfBECDFaB8671f009D22E65ea90e49512F6EC2eFE`)
+- [x] `withdraw_unallocated` verified live -- `FINALIZED`/`AGREE`, 5/5 validators, confirming the deterministic write path, account, and network are all healthy
+- [ ] `verify_milestone` verified live end-to-end (`NOT_SATISFIED` → `mark_live` → `SATISFIED` → fund release) on the Studio Devnet deployment -- **currently blocked**, not by this contract's code: every attempt traces to specific Studio Devnet validator nodes configured against an unreachable LLM provider (`router.ygr.ai`), a confirmed, GenLayer-team-acknowledged infrastructure gap ([`genvm-manager#7`](https://github.com/genlayerlabs/genvm-manager/issues/7), [`#13`](https://github.com/genlayerlabs/genvm-manager/issues/13)). Every attempt reverted cleanly with no state change; this mechanism was already live-verified end-to-end with real GEN on the original Bradbury 1.0.0 deployment (see `CHANGELOG.md`'s `[1.0.0]` entry), so the contract's correctness on this point does not depend on the Studio Devnet run completing -- but it should be retried and this line updated the moment it does, rather than left silently unfinished
+- [x] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new Studio Devnet address and an honest account of the above
+- [x] Pushed to GitHub
+- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository, deployed source, and the correct Studio Devnet evidence link
+
+The v1.4.0/Bradbury deployment plan is superseded by this migration -- v1.4.0's marker fix is carried forward unchanged into this v1.5.0 Studio Devnet deployment, not lost or reverted.
+
+## Steward-requested fix, round 4
+
+The round 3 resubmission was rejected twice: first for a stale evidence link (not a code issue -- the deployed v1.3.0 contract was verified correct via its own live schema, which has no `retry_release` method at all), then, after the link was corrected, for a genuinely new finding in the resubmission's own re-review. Quoted directly: *"the current code slices serialized state at 4,000 characters and hashes that sliced prefix, so a later state whose milestone-relevant change occurs after the cutoff is treated as unchanged and can never be re-verified."* Correct -- `verify_milestone`'s anti-farming marker (round 1's fix) was hashed from the display/prompt-truncated observed-state string, not the complete one, so two genuinely different states sharing an identical first 4000 characters produced the same marker, permanently blocking re-verification for any milestone whose satisfying change happened to live past that cutoff. See `CHANGELOG.md`'s `[1.4.0]` entry and `docs/DESIGN.md` §15 for the full account.
+
+- [x] Fix applied (marker now hashed from the complete observed state, before the separate truncation applied only for the LLM prompt and stored record); regression test added; test suite 40 → 41, all passing; `genvm-lint check`/`validate` both clean on the fixed source
+- [ ] Redeployed to GenLayer Testnet Bradbury
+- [ ] Post-deploy read verified
+- [ ] Deploy transaction reached genuine `FINALIZED` status
+- [ ] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new address
+- [ ] Pushed to GitHub
+- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository, deployed source, and the correct evidence link this time
+
+The v1.3.0 deployment (`0x46Bc691A9B79670ee5137585641fc455aA830961`) is superseded pending the above -- it still runs the marker bug. No live financial exposure identified at time of writing (no tranche on that deployment has ever produced an observed state anywhere near the 4000-character truncation threshold, so the bug has never actually been reachable there).
+
+## Steward-requested fix, round 3
 
 A real GenLayer Portal steward review of v1.2.0 flagged that `retry_release` was still not safe: "either party can send the full tranche a second time without proving the first transfer failed, and that extra payment can consume escrow held for other programs." Correct -- round 2's cap (`MAX_RELEASE_RETRIES = 1`) bounded the *number* of guaranteed duplicate payments but did not prevent the *first* one, since GenVM gives contract code no way to verify the retry's own precondition. `retry_release` is removed entirely rather than redesigned, since no on-chain signal exists that could gate it safely. This is the first fix in this project's history driven by external review rather than self-review -- our own three prior adversarial passes did not catch this. See `CHANGELOG.md`'s `[1.3.0]` entry and `docs/DESIGN.md` §14 for the full account.
 
@@ -64,9 +95,9 @@ A real GenLayer Portal steward review of v1.2.0 flagged that `retry_release` was
 - [x] Deploy transaction reached genuine `FINALIZED` status, confirmed `AGREE`/`FINISHED_WITH_RETURN`
 - [x] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new address
 - [x] Pushed to GitHub
-- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository and deployed source
+- [x] Resubmitted -- rejected twice, first for a stale evidence link (fixed), then for the marker-truncation finding now tracked as round 4 above
 
-The v1.2.0 deployment (`0x5b20f2833D1BCad3830eb08C40559AA57B0a7D0f`) is superseded pending the above -- it still runs the unsafe capped `retry_release`. No live financial exposure identified at time of writing (no tranche on that deployment has ever reached `RELEASED`, so the guaranteed-duplicate-payment path has never actually been reachable there).
+The v1.2.0 deployment (`0x5b20f2833D1BCad3830eb08C40559AA57B0a7D0f`) is superseded -- it still runs the unsafe capped `retry_release`. No live financial exposure identified at time of writing (no tranche on that deployment has ever reached `RELEASED`, so the guaranteed-duplicate-payment path has never actually been reachable there).
 
 ## Post-fix redeploy, round 2
 

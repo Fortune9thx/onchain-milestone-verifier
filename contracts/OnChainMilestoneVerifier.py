@@ -1,11 +1,27 @@
-# v0.2.16
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# v0.3.0
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
 """
 OnChainMilestoneVerifier -- a reusable GenLayer primitive for releasing
 escrowed grant/bounty funds only when independent validators agree that a
 target contract's actual, already-finalized on-chain state satisfies a
 plain-language milestone.
+
+## Why this contract is on Studio Devnet, not Bradbury
+
+This project shipped and iterated on GenLayer Testnet Bradbury through
+v1.4.0. Bradbury then suffered a confirmed, network-wide, multi-day
+outage -- independently corroborated by an unrelated project hitting the
+identical fee-estimation failure at the same time -- coinciding with this
+account's toolchain having already been upgraded (system-wide, for
+unrelated work) to the GenLayer Consensus v0.6 / SDK v0.3.0 release
+train, which Bradbury's older consensus stack cannot correctly serve
+requests from. Rather than wait indefinitely on an infrastructure issue
+outside this project's control, this revision migrates to Studio
+Devnet, the network Consensus v0.6 actually targets, porting the
+contract to the v0.3.0 API in the process. See docs/DESIGN.md §16 for
+the full account of the outage, the migration, and every API surface
+change this port required.
 
 ## What this contract does
 
@@ -36,11 +52,11 @@ every node that reads it, by the same guarantee that makes the rest of the
 chain's state deterministic in the first place. This contract's cross-
 contract read (in `verify_milestone` below) is therefore performed exactly
 ONCE, in the *deterministic* body of `verify_milestone`, using
-`gl.get_contract_at(...).view(state=StorageType.
-LATEST_FINAL)` -- explicitly requesting finalized state, not
-`LATEST_NON_FINAL` (the SDK's own default), because "latest non-final"
-state can differ node-to-node if a competing transaction against the
-target contract is itself still being decided, which would make the read
+`gl.contract.get_at(...).view(state=StorageView.LATEST_FINALIZED,
+catch_vm_error=True)` -- explicitly requesting finalized state, not
+`LATEST_DECIDED` (the SDK's own default), because "latest decided" state
+can differ node-to-node if a competing transaction against the target
+contract is itself still being decided, which would make the read
 non-deterministic in exactly the way this design otherwise avoids.
 
 The result of that single, deterministic, finalized read is then closed
@@ -61,10 +77,11 @@ read in this contract happens.
 
 ## Why the target view method is called by NAME, not by a fixed interface
 
-`gl.get_contract_at(address)` returns a proxy whose `.view()`/`.emit()`
+`gl.contract.get_at(address)` returns a `Proxy` whose `.view()`/`.emit()`
 namespaces resolve ANY attribute access to a same-named remote call
-(`genlayer.gl.genvm_contracts._ContractAtGetter.__getattr__`) -- this is
-true whether that attribute access is written as `proxy.view().foo()` or as
+(`genlayer.contract._CaughtViewMethods.__getattr__` when `catch_vm_error`
+is set, `_ContractAt`'s own dynamic dispatch otherwise) -- this is true
+whether that attribute access is written as `proxy.view().foo()` or as
 `getattr(proxy.view(), "foo")()`, since Python's `getattr` triggers the
 exact same lookup machinery as dot-syntax. This contract relies on that
 directly: `view_method` is a caller-supplied string (validated as a
@@ -99,10 +116,18 @@ Two independent gates close this. (1) Each tranche stores a
 state from its most recent verification attempt (or a fixed sentinel if
 that attempt's read failed) -- and a fresh attempt whose newly-observed
 marker is unchanged from the stored one is rejected immediately, before
-any cross-contract read, non-deterministic judgment, or storage write.
-(2) Consecutive attempts on the same tranche must be spaced at least
-`MIN_VERIFICATION_INTERVAL_SECONDS` apart, checked against
-`last_attempt_at` before anything else in the method runs.
+any cross-contract read result is used for anything else, and before any
+non-deterministic judgment or storage write. This hash is computed over
+the COMPLETE observed state, before the separate, later truncation
+applied for prompt/storage size -- hashing the truncated string instead
+would let two genuinely different states that happen to share an
+identical truncated prefix collide onto the same marker, making a
+milestone-relevant change that occurs only past the truncation cutoff
+permanently invisible to this gate (a real finding from a GenLayer
+Portal steward review). (2) Consecutive attempts on the same tranche
+must be spaced at least `MIN_VERIFICATION_INTERVAL_SECONDS` apart,
+checked against `last_attempt_at` before anything else in the method
+runs.
 
 A fixed *count* cap (rather than a cooldown) was tried first and
 deliberately reverted: it closed the farming path but opened a worse one
@@ -136,9 +161,9 @@ rationale that consensus has to agree on byte-for-byte -- exactly the
 unbound-quantitative-outcome failure mode that has been a real, documented
 GenLayer Portal rejection reason in this account's history. Only the
 `"SATISFIED"` outcome ever triggers a fund release
-(`gl.get_contract_at(grantee).emit_transfer(...)`), and that release happens in the
-contract's deterministic tail, strictly after `strict_eq` has already
-returned a value every agreeing node reproduced identically.
+(`gl.contract.get_at(grantee).emit_transfer(...)`), and that release
+happens in the contract's deterministic tail, strictly after `strict_eq`
+has already returned a value every agreeing node reproduced identically.
 
 ## Why a failed cross-contract read short-circuits to INSUFFICIENT_STATE
 ## without ever invoking the non-deterministic judgment at all
@@ -155,19 +180,39 @@ deterministic read genuinely succeeded and there is a real semantic
 question -- "does this specific, successfully-observed state satisfy this
 specific milestone" -- left to answer.
 
+The v0.3.0 SDK's `Proxy.view(catch_vm_error=True)` makes ONE class of
+failure exact: a call that fails with a VM_ERROR result code returns a
+`genlayer.vm.VMError` instance rather than raising, so
+`isinstance(result, VMError)` distinguishes that specific failure from a
+target view method's own genuine, successful `None`/null return. This is
+not a complete fix, though, and this contract does not claim otherwise:
+`gl_call_generic` still resolves to plain `None` -- not a `VMError` --
+whenever the underlying call fails at the transport/dispatch level before
+any result code is produced at all (confirmed live against gltest's own
+direct-mode mock). A bare `None` here therefore remains ambiguous between
+"genuinely returned null" and "failed below where `catch_vm_error` can
+see it" -- the same accepted limitation the pre-migration (v0.2.16 API)
+version of this contract already documented, only partially narrowed by
+this migration, not resolved by it. Both `None` and `VMError` are treated
+identically as a failed read.
+
 ## Storage and economic design
 
 Every record (`programs`, `tranches`, `verifications`) is stored as a
 JSON-encoded `str` value in a `TreeMap[str, str]`, consistent with this
-account's Bradbury storage practice: index lists (`program_tranche_ids`,
+account's established storage practice: index lists (`program_tranche_ids`,
 `tranche_verification_ids`, `grantee_tranche_ids`) are also JSON-encoded
 strings, appended to on write, rather than nested collections -- a
 `TreeMap[str, DynArray[str]]`-shaped value is an untested storage shape on
 this dependency pin and was deliberately not risked here, for the same
 reason documented at length in IndependentCanonicalExtractor's own
-docs/DESIGN.md. `program_ids` is the one genuine top-level `DynArray[str]`
-(confirmed-safe as a bare annotation, never explicitly constructed --
-`DynArray()`'s own `__init__` forbids direct instantiation).
+docs/DESIGN.md. `program_ids` is the one genuine top-level `DynArray[str]`.
+Every `TreeMap`/`DynArray` field in this contract, `program_ids` included,
+is a bare annotation with no explicit construction in `__init__` -- the
+v0.3.0 SDK forbids explicitly instantiating any generic storage class
+directly (confirmed live: `TreeMap()`/`DynArray()` both raise
+`GenerationError`, not just `DynArray()` as under the pre-migration SDK),
+relying entirely on the framework's own default-init machinery instead.
 
 Escrowed funds always move in checks-effects-interactions order: a
 tranche's status is flipped to `RELEASED` in storage *before*
@@ -218,8 +263,11 @@ Full design rationale, threat model, and integration guide:
 see docs/DESIGN.md in this repository.
 """
 
-from genlayer import *
-from genlayer.py.public_abi import StorageType
+import genlayer as gl
+from genlayer.types import *
+from genlayer.storage import TreeMap, DynArray
+from genlayer.vm import VMError
+from genlayer.vm.public_abi import StorageView
 import hashlib
 import json
 import re
@@ -318,7 +366,7 @@ after it, in exactly this shape:
 # ---------------------------------------------------------------------------
 
 
-class OnChainMilestoneVerifier(gl.Contract):
+class OnChainMilestoneVerifier(gl.contract.Contract):
     programs: TreeMap[str, str]
     tranches: TreeMap[str, str]
     verifications: TreeMap[str, str]
@@ -331,25 +379,16 @@ class OnChainMilestoneVerifier(gl.Contract):
     verification_counter: u256
 
     def __init__(self):
-        # Explicit initialization for every TreeMap and every counter,
-        # matching this account's established, live-verified pattern
-        # (genlayer.py.storage.tree_map.TreeMap has no custom __init__ of
-        # its own -- calling TreeMap() constructs a fresh, empty,
-        # storage-integrated map through the same @allow_storage default-
-        # initialization machinery a bare annotation would use lazily, so
-        # this is a no-op relative to that default, made explicit).
-        # program_ids (DynArray[str]) is deliberately NOT assigned here --
-        # unlike TreeMap, DynArray's own __init__ exists specifically to
-        # forbid direct instantiation (raises TypeError), confirmed both
-        # by reading the SDK source and by a prior project's test suite
-        # catching it immediately. DynArray fields are left as a bare
-        # annotation, the only safe pattern.
-        self.programs = TreeMap()
-        self.tranches = TreeMap()
-        self.verifications = TreeMap()
-        self.program_tranche_ids = TreeMap()
-        self.tranche_verification_ids = TreeMap()
-        self.grantee_tranche_ids = TreeMap()
+        # v0.3.0 SDK finding (confirmed via live gltest direct-mode
+        # failure, not assumed): generic storage classes -- TreeMap AND
+        # DynArray alike now, not just DynArray as under the pre-v0.3.0
+        # SDK -- can no longer be explicitly instantiated in __init__ at
+        # all ("generic storage classes can not be instantiated with
+        # __init__, please, use gl.storage.inmem_allocate"). Every
+        # TreeMap/DynArray field below is therefore left as a bare
+        # annotation only, relying on the framework's own default-init
+        # machinery, matching what was previously only required for
+        # DynArray fields specifically.
         self.program_counter = u256(0)
         self.tranche_counter = u256(0)
         self.verification_counter = u256(0)
@@ -373,7 +412,7 @@ class OnChainMilestoneVerifier(gl.Contract):
             raise gl.vm.UserError(f"invalid grantee address: {grantee!r}")
 
         funder = str(gl.message.sender_address)
-        created_at = str(gl.message_raw.get("datetime", ""))
+        created_at = str(gl.message.raw.get("datetime", ""))
 
         program_id = f"program-{int(self.program_counter)}"
         self.program_counter = u256(int(self.program_counter) + 1)
@@ -449,7 +488,7 @@ class OnChainMilestoneVerifier(gl.Contract):
 
         view_args = _validate_view_args(view_args_json)
 
-        created_at = str(gl.message_raw.get("datetime", ""))
+        created_at = str(gl.message.raw.get("datetime", ""))
         tranche_id = f"{program_id}-tranche-{int(self.tranche_counter)}"
         self.tranche_counter = u256(int(self.tranche_counter) + 1)
 
@@ -484,7 +523,7 @@ class OnChainMilestoneVerifier(gl.Contract):
     @gl.public.write
     def verify_milestone(self, tranche_id: str) -> str:
         """Reads `tranche`'s target contract's view method once,
-        deterministically, against LATEST_FINAL state. If that read
+        deterministically, against LATEST_FINALIZED state. If that read
         fails, records INSUFFICIENT_STATE with no LLM call. If it
         succeeds, every validator independently judges (via
         `gl.eq_principle.strict_eq`) whether the observed state satisfies
@@ -535,51 +574,72 @@ class OnChainMilestoneVerifier(gl.Contract):
         # identical failure), so it is handled here, deterministically,
         # rather than inside the judgment.
         #
-        # IMPORTANT, verified directly against the installed SDK source
-        # (genlayer/gl/_internal/gl_call.py) and confirmed by this
-        # contract's own test suite: a CallContract failure does NOT
-        # raise a Python exception here -- gl_call_generic returns a
-        # Lazy resolving to plain `None` when the underlying gl_call
-        # fails, silently. try/except alone is therefore NOT sufficient
-        # to detect a failed read; `raw_state is None` must be checked
-        # explicitly too. The one accepted trade-off: a target view
-        # method whose own genuine, successful return value is a bare
-        # `null`/`None` cannot be distinguished from a failed read here,
-        # and is treated as INSUFFICIENT_STATE either way. This is
-        # deliberate, not an oversight -- see docs/DESIGN.md -- a null
-        # result could never by itself justify releasing funds anyway,
-        # so no real judgment is lost by short-circuiting it.
+        # `catch_vm_error=True` (v0.3.0 SDK) makes a call that fails with a
+        # VM_ERROR result code return a `VMError` instance rather than
+        # raising -- confirmed via the real installed SDK source
+        # (genlayer/contract/__init__.py's `Proxy.view`/
+        # `_CaughtViewMethods`). This does NOT cover every failure mode,
+        # though: `genlayer/_internal/on_chain/gl_call.py`'s
+        # `gl_call_generic` still resolves to plain `None` -- not a
+        # `VMError`, and not a raised exception -- whenever the underlying
+        # call fails at the transport/dispatch level before a result code
+        # is ever produced (confirmed live: a target/method that doesn't
+        # resolve at all decodes this way, both against gltest's
+        # direct-mode mock and, by the same code path, presumably in
+        # production for a sufficiently malformed target). So a bare
+        # `None` here is STILL ambiguous between "the target's own view
+        # method genuinely, successfully returned null" and "the call
+        # failed below the level catch_vm_error can see" -- the same
+        # accepted trade-off the pre-migration (v0.2.16) version of this
+        # contract already documented, not fully resolved by this
+        # migration despite `catch_vm_error` handling the VM_ERROR case
+        # specifically. Both `None` and `VMError` are therefore still
+        # treated as a failed read below. The outer try/except remains as
+        # defense in depth for any other unexpected exception.
         #
-        # ALSO CONFIRMED LIVE ON BRADBURY (docs/DESIGN.md #9a): if the
-        # target's relevant state has been ACCEPTED but not yet FINALIZED,
-        # querying LATEST_FINAL is a VM-level fault (result_code VM_ERROR),
-        # not a Python exception -- it reverts this whole transaction
-        # before even reaching this try/except, let alone the except
-        # clause. No code-level fix exists for this; callers must wait
-        # for the target's write to reach FINALIZED before triggering
-        # verify_milestone against it. Documented for integrators, not
-        # silently discovered by them.
+        # ALSO CONFIRMED LIVE ON BRADBURY, pre-migration (docs/DESIGN.md
+        # #9a): if the target's relevant state has been ACCEPTED/DECIDED
+        # but not yet FINALIZED, querying finalized state can be a
+        # VM-level fault rather than a caught VMError -- callers must
+        # wait for the target's write to reach FINALIZED before
+        # triggering verify_milestone against it. Not yet re-confirmed
+        # against the v0.3.0 SDK/Studio Devnet specifically; documented
+        # for integrators either way, not silently discovered by them.
         # -----------------------------------------------------------------
         try:
-            raw_state = getattr(
-                gl.get_contract_at(Address(target_contract)).view(
-                    state=StorageType.LATEST_FINAL
+            result = getattr(
+                gl.contract.get_at(Address(target_contract)).view(
+                    state=StorageView.LATEST_FINALIZED, catch_vm_error=True
                 ),
                 view_method,
             )(*view_args)
-            read_ok = raw_state is not None
+            read_ok = result is not None and not isinstance(result, VMError)
+            raw_state = result if read_ok else None
             observed_state = _stringify_view_result(raw_state) if read_ok else None
         except Exception:
             observed_state = None
             read_ok = False
 
         if read_ok:
-            observed_state_json = json.dumps(observed_state, sort_keys=True)
+            full_observed_state_json = json.dumps(observed_state, sort_keys=True)
+            # Marker is hashed from the COMPLETE state, before any
+            # display/prompt truncation below -- a real GenLayer Portal
+            # steward finding: hashing the truncated string instead meant
+            # two genuinely different states sharing an identical first
+            # MAX_OBSERVED_STATE_CHARS prefix produced identical markers,
+            # so a milestone-relevant change occurring only past the
+            # truncation cutoff was invisible to the unchanged-state gate
+            # and could never be re-verified. `_stringify_view_result`
+            # already bounds this value's structural complexity (depth,
+            # per-level items, total node count); hashing it in full here
+            # is a linear, well-bounded operation regardless of length.
+            marker = hashlib.sha256(full_observed_state_json.encode("utf-8")).hexdigest()
+
+            observed_state_json = full_observed_state_json
             if len(observed_state_json) > MAX_OBSERVED_STATE_CHARS:
                 observed_state_json = (
                     observed_state_json[:MAX_OBSERVED_STATE_CHARS] + "...<truncated>"
                 )
-            marker = hashlib.sha256(observed_state_json.encode("utf-8")).hexdigest()
         else:
             observed_state_json = None
             marker = "READ_FAILED"
@@ -643,7 +703,7 @@ class OnChainMilestoneVerifier(gl.Contract):
         # flips to RELEASED, and the program's released total is updated,
         # strictly before emit_transfer is invoked.
         # -----------------------------------------------------------------
-        verified_at = str(gl.message_raw.get("datetime", ""))
+        verified_at = str(gl.message.raw.get("datetime", ""))
         verification_id = f"{tranche_id}-verify-{int(self.verification_counter)}"
         self.verification_counter = u256(int(self.verification_counter) + 1)
 
@@ -671,7 +731,7 @@ class OnChainMilestoneVerifier(gl.Contract):
             program["released"] = str(int(program["released"]) + int(tranche["amount"]))
             self.programs[tranche["program_id"]] = json.dumps(program, sort_keys=True)
 
-            gl.get_contract_at(Address(program["grantee"])).emit_transfer(
+            gl.contract.get_at(Address(program["grantee"])).emit_transfer(
                 value=u256(int(tranche["amount"]))
             )
         else:
@@ -701,7 +761,7 @@ class OnChainMilestoneVerifier(gl.Contract):
         program["total_escrowed"] = str(int(program["total_escrowed"]) - remaining)
         self.programs[program_id] = json.dumps(program, sort_keys=True)
 
-        gl.get_contract_at(Address(program["funder"])).emit_transfer(value=u256(remaining))
+        gl.contract.get_at(Address(program["funder"])).emit_transfer(value=u256(remaining))
 
     # -----------------------------------------------------------------
     # Public write: funder reclaims a tranche whose milestone was never
@@ -982,7 +1042,7 @@ def _iter_balanced_json_objects(text: str):
 
 def _seconds_since(iso_datetime: str) -> int:
     """Deterministic elapsed-seconds computation from an ISO-8601
-    timestamp (as stored from `gl.message_raw["datetime"]`) to the current
+    timestamp (as stored from `gl.message.raw["datetime"]`) to the current
     transaction's own canonical timestamp -- never `datetime.now()`
     directly, so this is identical on every node re-executing this
     transaction. Tolerates both with- and without-microseconds ISO forms,
@@ -990,7 +1050,7 @@ def _seconds_since(iso_datetime: str) -> int:
     while some test harnesses omit them."""
     import datetime
 
-    now_str = str(gl.message_raw.get("datetime", ""))
+    now_str = str(gl.message.raw.get("datetime", ""))
     for fmt in ("%Y-%m-%dT%H:%M:%S.%fZ", "%Y-%m-%dT%H:%M:%SZ"):
         try:
             now = datetime.datetime.strptime(now_str, fmt)

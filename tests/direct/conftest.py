@@ -35,14 +35,18 @@ def install_call_contract_mock(vm, responses):
     Call again to replace the mapping; keys not present simply fail the
     call (matches a real target contract/method that doesn't exist).
     """
-    from genlayer.py import calldata
+    import genlayer.calldata as calldata
 
     def hook(vm_ctx, request):
         if not isinstance(request, dict) or "CallContract" not in request:
             return None
         call = request["CallContract"]
         address_hex = str(call["address"]).lower()
-        method_name = call["calldata"].get("method")
+        # v0.3.0's _make_calldata_obj stores the method name under the
+        # empty-string key (`ret[''] = method`), not `"method"` -- a real
+        # finding, confirmed by reading genlayer/contract/__init__.py
+        # directly rather than assuming the pre-migration key still held.
+        method_name = call["calldata"].get("")
         key = (address_hex, method_name)
         if key not in responses:
             return None
@@ -56,22 +60,25 @@ def install_call_contract_mock(vm, responses):
 
 def warp_with_message(vm, iso_timestamp: str) -> None:
     """vm.warp() alone patches datetime.datetime.now() (via a
-    _WarpedDatetime subclass) but does NOT update
-    gl.message_raw["datetime"] -- that dict is populated once, at
-    deploy/import time, by _inject_message_to_fd0, and gltest's own
-    VMContext._refresh_gl_message() (called by vm.warp() internally) only
-    refreshes sender/origin/value/chain_id, never datetime. A contract
-    that reads gl.message_raw["datetime"] directly (the transaction-
-    canonical timestamp, preferred over datetime.now() for anything
-    stored/consensus-relevant, per this account's established practice)
-    would otherwise see a frozen deploy-time value no matter how many
-    later vm.warp() calls happen. This helper does both: warps the VM AND
-    directly patches the already-imported genlayer.gl module's
-    message_raw dict, scoped to this test file only, never touching the
-    contract or the real SDK."""
+    _WarpedDatetime subclass) but does NOT update the live
+    genlayer.message module's `raw["datetime"]` -- confirmed by reading
+    gltest's own direct/vm.py: warp() calls self._refresh_gl_message(),
+    which calls direct/sdk_compat.py's sync_message_context(), which
+    updates sender_address/origin_address/value/chain_id on the real
+    genlayer.message module (and its raw dict) but deliberately excludes
+    datetime (not one of its accepted kwargs). This is the SAME gap this
+    account has hit before under the pre-v0.3.0 gl.message_raw module,
+    just relocated to genlayer.message.raw under the v0.3.0 API -- a
+    contract reading gl.message.raw["datetime"] directly (the
+    transaction-canonical timestamp, preferred over datetime.now() for
+    anything stored/consensus-relevant) would otherwise see a frozen
+    deploy-time value no matter how many later vm.warp() calls happen.
+    This helper does both: warps the VM AND directly patches the
+    already-imported genlayer.message module's raw dict, scoped to this
+    test file only, never touching the contract or the real SDK."""
     import sys
 
     vm.warp(iso_timestamp)
-    gl_module = sys.modules.get("genlayer.gl")
-    if gl_module is not None and hasattr(gl_module, "message_raw"):
-        gl_module.message_raw["datetime"] = iso_timestamp
+    message_module = sys.modules.get("genlayer.message")
+    if message_module is not None and hasattr(message_module, "raw"):
+        message_module.raw["datetime"] = iso_timestamp

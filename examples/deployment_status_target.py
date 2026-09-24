@@ -1,5 +1,5 @@
-# v0.2.16
-# { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
+# v0.3.0
+# { "Depends": "py-genlayer:5jycge4q8k23462jtb0b9fyey1s9qz928sz2nbrd9mg4sxqg2qng" }
 
 """
 DeploymentStatusTarget -- illustrative reference only, not part of this
@@ -11,12 +11,13 @@ deliverable, exposing a plain view method a funder can point a tranche at.
 Nothing here is specific to OnChainMilestoneVerifier's own code -- that is
 the point. Any already-deployed GenVM contract with a view method works,
 because OnChainMilestoneVerifier calls it by name at verification time
-(`getattr(contract.view(state=StorageType.LATEST_FINAL), view_method)`),
-not through any interface this contract declares in advance.
+(`getattr(contract.view(state=StorageView.LATEST_FINALIZED,
+catch_vm_error=True), view_method)`), not through any interface this
+contract declares in advance.
 
 ## The scenario
 
-A grantee is funded to deploy and mark a project "LIVE" on Bradbury. The
+A grantee is funded to deploy and mark a project "LIVE" on GenLayer. The
 funder does not want to trust the grantee's own claim that deployment
 succeeded -- they want the verifier to check the grantee's own deployed
 contract's own state.
@@ -48,10 +49,10 @@ satisfied only because they all observed the identical finalized value,
 not because either party asserted it.
 """
 
-from genlayer import *
+import genlayer as gl
 
 
-class DeploymentStatusTarget(gl.Contract):
+class DeploymentStatusTarget(gl.contract.Contract):
     status: str
 
     def __init__(self):
