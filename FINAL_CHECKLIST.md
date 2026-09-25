@@ -54,22 +54,38 @@
 - [x] Repository link added to `PORTAL_SUBMISSION.md`
 - [x] `.github/workflows/ci.yml` pushed and confirmed green on a real GitHub Actions run (all three checks — `genvm-lint check`, `genvm-lint validate`, and the 36-test suite — passed on a clean runner)
 
-## Network migration, round 5 (current) -- Bradbury outage to Studio Devnet
+## Live-blocking platform bug found and worked around, round 6 (current) -- CallContract/LATEST_FINALIZED
+
+After round 5's migration (below), `verify_milestone` hung on 16 consecutive live attempts on Studio Devnet, across every LLM provider the network exposed -- ruling out "one broken provider." A controlled A/B test with two throwaway probe contracts (one requesting `state=StorageView.LATEST_FINALIZED`, one omitting it) isolated the true cause: Studio Devnet's `CallContract` dispatch hangs specifically on `storage_view=LATEST_FINALIZED`, independent of any LLM call. `verify_milestone` now omits that argument, accepting the SDK's default (`LATEST_DECIDED`) and its narrow, disclosed determinism trade-off. See `CHANGELOG.md`'s `[1.6.0]` entry and `docs/DESIGN.md` §16 for the full repro and rationale.
+
+- [x] Root cause isolated via a live, controlled A/B test (not assumed) -- two probe contracts, decisive result
+- [x] Fix applied (`state=` argument removed from the read site, code comment + module docstring updated to document the trade-off and the revert condition); `genvm-lint check`/`validate` both clean; test suite still 41/41 passing, no regression
+- [x] Redeployed to GenLayer Studio Devnet: `0x73bB5342Cd0AF3BB52cEBc300a3F360fffd66Bb0`
+- [x] Post-deploy read verified
+- [x] **`verify_milestone` verified live end-to-end with real GEN, both outcomes:** `NOT_SATISFIED` (target `"PENDING"`, zero funds moved) on `program-0-tranche-0`; after target `mark_live()`, `SATISFIED` on `program-0-tranche-1` -- 1 GEN released, tranche `RELEASED`, program `released` total correctly updated
+- [x] `create_program`/`register_tranche`/`withdraw_unallocated` re-verified live on the new deployment
+- [x] `README.md` / `PORTAL_SUBMISSION.md` / this file / `docs/DESIGN.md` §16 / `CHANGELOG.md` updated with the new address and complete live-proof evidence
+- [x] Pushed to GitHub
+- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository, deployed source, and the correct Studio Devnet evidence link
+
+The v1.5.0 deployment (`0x6892dD5Cdccaa536aA86ba38d14cB99F2FFE50AA`) is superseded by this fix -- it still requests `LATEST_FINALIZED` and cannot complete `verify_milestone` live on this network. Its `create_program`/`register_tranche`/`withdraw_unallocated` live proof remains valid evidence that the account, network, and deterministic write path were healthy throughout; only the specific `CallContract`/`LATEST_FINALIZED` combination was broken.
+
+## Network migration, round 5 -- Bradbury outage to Studio Devnet
 
 Before the round 4 fix (below) could redeploy to Bradbury, Bradbury's `FeeManager` began reverting on routine fee-quote calls for every deploy/write attempt -- a confirmed, multi-day network outage, corroborated by an identical failure hitting an unrelated project in this account's portfolio in the same window. This account's toolchain had already moved to GenLayer Consensus v0.6 / SDK v0.3.0, which Bradbury's older stack cannot correctly serve. This release migrates to Studio Devnet (`studioDevnet`, chain id `61997`) and ports the contract to the v0.3.0 API. See `CHANGELOG.md`'s `[1.5.0]` entry and `docs/DESIGN.md` §16 for the full account, including every API surface change.
 
 - [x] v0.3.0 API migration applied (no public method signature changes); `genvm-lint check`/`validate` both clean; test suite still 41/41 passing after fixing `gltest` v0.3.0 mock-compatibility gaps
 - [x] CI toolchain pin updated to the matching v0.3.0-era `genlayer-test`/`genvm-linter` release
-- [x] Redeployed to GenLayer Studio Devnet: `0x6892dD5Cdccaa536aA86ba38d14cB99F2FFE50AA`
+- [x] Redeployed to GenLayer Studio Devnet (superseded by round 6 above)
 - [x] Post-deploy read verified (`get_program_count()`/`list_program_ids()` readable immediately after deploy)
-- [x] `create_program` and `register_tranche` verified live with real GEN (2 GEN escrowed, 1 GEN tranche registered against a redeployed `DeploymentStatusTarget` at `0xfBECDFaB8671f009D22E65ea90e49512F6EC2eFE`)
+- [x] `create_program` and `register_tranche` verified live with real GEN
 - [x] `withdraw_unallocated` verified live -- `FINALIZED`/`AGREE`, 5/5 validators, confirming the deterministic write path, account, and network are all healthy
-- [ ] `verify_milestone` verified live end-to-end (`NOT_SATISFIED` → `mark_live` → `SATISFIED` → fund release) on the Studio Devnet deployment -- **currently blocked**, not by this contract's code: every attempt traces to specific Studio Devnet validator nodes configured against an unreachable LLM provider (`router.ygr.ai`), a confirmed, GenLayer-team-acknowledged infrastructure gap ([`genvm-manager#7`](https://github.com/genlayerlabs/genvm-manager/issues/7), [`#13`](https://github.com/genlayerlabs/genvm-manager/issues/13)). Every attempt reverted cleanly with no state change; this mechanism was already live-verified end-to-end with real GEN on the original Bradbury 1.0.0 deployment (see `CHANGELOG.md`'s `[1.0.0]` entry), so the contract's correctness on this point does not depend on the Studio Devnet run completing -- but it should be retried and this line updated the moment it does, rather than left silently unfinished
+- [x] `verify_milestone` verified live end-to-end -- see round 6 above (required the `LATEST_DECIDED` fix; the v1.5.0 deployment alone could not complete this)
 - [x] `README.md` / `PORTAL_SUBMISSION.md` / this file updated with the new Studio Devnet address and an honest account of the above
 - [x] Pushed to GitHub
-- [ ] Resubmitted to the GenLayer Portal steward review with the updated repository, deployed source, and the correct Studio Devnet evidence link
+- [x] Resubmission proceeds directly to round 6's state, above
 
-The v1.4.0/Bradbury deployment plan is superseded by this migration -- v1.4.0's marker fix is carried forward unchanged into this v1.5.0 Studio Devnet deployment, not lost or reverted.
+The v1.4.0/Bradbury deployment plan is superseded by this migration -- v1.4.0's marker fix is carried forward unchanged into the Studio Devnet deployment, not lost or reverted.
 
 ## Steward-requested fix, round 4
 

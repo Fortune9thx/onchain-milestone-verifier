@@ -52,12 +52,36 @@ every node that reads it, by the same guarantee that makes the rest of the
 chain's state deterministic in the first place. This contract's cross-
 contract read (in `verify_milestone` below) is therefore performed exactly
 ONCE, in the *deterministic* body of `verify_milestone`, using
-`gl.contract.get_at(...).view(state=StorageView.LATEST_FINALIZED,
-catch_vm_error=True)` -- explicitly requesting finalized state, not
-`LATEST_DECIDED` (the SDK's own default), because "latest decided" state
-can differ node-to-node if a competing transaction against the target
-contract is itself still being decided, which would make the read
-non-deterministic in exactly the way this design otherwise avoids.
+`gl.contract.get_at(...).view(catch_vm_error=True)`.
+
+Architecturally, `state=StorageView.LATEST_FINALIZED` is the value that
+belongs here, not `LATEST_DECIDED` (the SDK's own default): "latest
+decided" state can differ node-to-node if a competing transaction against
+the target contract is itself still being decided, which would make the
+read non-deterministic in exactly the way this design otherwise avoids.
+This contract does not currently pass that argument, though, because doing
+so is a confirmed, reproducible platform bug on Studio Devnet's current
+build as of this writing: a live, controlled A/B test (two otherwise-
+identical throwaway probe contracts, one with `state=
+StorageView.LATEST_FINALIZED`, one without) showed the explicit
+`LATEST_FINALIZED` request hanging the leader's `CallContract` dispatch
+indefinitely on every attempt, while the identical call without it
+(falling back to `LATEST_DECIDED`) succeeded in under three seconds,
+repeatably. See docs/DESIGN.md §16 for the full repro, including both
+probe contracts' addresses and transaction hashes. Given that choice --
+ship a contract that cannot complete a single live cross-contract read on
+the network it's deployed to, or accept the narrow, disclosed determinism
+gap `LATEST_DECIDED` reintroduces -- this contract accepts the gap rather
+than the unusable alternative. The gap is real but narrow: it is only
+observable if a competing write against the SAME target contract is
+itself still mid-consensus (not yet finalized) at the exact moment
+`verify_milestone` reads it, which requires the target contract to have
+an in-flight write concurrent with the verification call; it does not
+affect the correctness of the read once the target's relevant write has
+settled, and does not affect this contract's own storage or judgment
+logic at all. Revert to `state=StorageView.LATEST_FINALIZED` once Studio
+Devnet's `CallContract` dispatch bug is fixed upstream -- this is
+explicitly a platform-driven workaround, not a design preference.
 
 The result of that single, deterministic, finalized read is then closed
 over as a plain local variable by the leader function passed to
@@ -267,7 +291,6 @@ import genlayer as gl
 from genlayer.types import *
 from genlayer.storage import TreeMap, DynArray
 from genlayer.vm import VMError
-from genlayer.vm.public_abi import StorageView
 import hashlib
 import json
 import re
@@ -523,8 +546,10 @@ class OnChainMilestoneVerifier(gl.contract.Contract):
     @gl.public.write
     def verify_milestone(self, tranche_id: str) -> str:
         """Reads `tranche`'s target contract's view method once,
-        deterministically, against LATEST_FINALIZED state. If that read
-        fails, records INSUFFICIENT_STATE with no LLM call. If it
+        deterministically (against LATEST_DECIDED state -- see module
+        docstring for why LATEST_FINALIZED, architecturally correct here,
+        is not currently used). If that read fails, records
+        INSUFFICIENT_STATE with no LLM call. If it
         succeeds, every validator independently judges (via
         `gl.eq_principle.strict_eq`) whether the observed state satisfies
         the milestone; only "SATISFIED" releases the tranche's escrowed
@@ -608,8 +633,20 @@ class OnChainMilestoneVerifier(gl.contract.Contract):
         # -----------------------------------------------------------------
         try:
             result = getattr(
+                # state=StorageView.LATEST_FINALIZED is architecturally
+                # correct here (see module docstring) but is deliberately
+                # NOT passed: a confirmed, reproducible Studio Devnet
+                # platform bug hangs CallContract dispatch indefinitely
+                # whenever storage_view=LATEST_FINALIZED specifically,
+                # while the default (LATEST_DECIDED) succeeds reliably --
+                # verified via a live, controlled A/B test with two
+                # otherwise-identical throwaway probe contracts (see
+                # docs/DESIGN.md #16 for the full repro). This is a
+                # disclosed, narrow trade-off accepted to keep the
+                # contract usable on the network it targets, not a design
+                # preference -- revert once the upstream bug is fixed.
                 gl.contract.get_at(Address(target_contract)).view(
-                    state=StorageView.LATEST_FINALIZED, catch_vm_error=True
+                    catch_vm_error=True
                 ),
                 view_method,
             )(*view_args)

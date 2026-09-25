@@ -2,6 +2,14 @@
 
 All notable changes to this project are documented in this file.
 
+## [1.6.0] - 2026-09-25
+
+`verify_milestone`'s live run was blocked on Studio Devnet after 16 consecutive `TIMEOUT`/hang failures across every LLM provider the network exposed. A controlled A/B test using two otherwise-identical throwaway probe contracts isolated the true cause: Studio Devnet's `CallContract` dispatch hangs specifically when `storage_view` is `LATEST_FINALIZED`, independent of any LLM involvement -- `LATEST_DECIDED` (the SDK's default) works reliably. `verify_milestone`'s cross-contract read now omits `state=StorageView.LATEST_FINALIZED`, accepting `LATEST_DECIDED`'s narrow, disclosed determinism trade-off (only observable if the target contract has a write concurrently mid-consensus at the exact moment of the read) in exchange for a contract that actually completes its core mechanism on the network it targets. See `docs/DESIGN.md` §16 for the full repro and rationale; revert once the upstream `CallContract` bug is fixed.
+
+- Redeployed to Studio Devnet: `0x73bB5342Cd0AF3BB52cEBc300a3F360fffd66Bb0`.
+- **Full live end-to-end proof completed with real GEN, both outcomes:** `verify_milestone` against the target's `"PENDING"` state correctly judged `NOT_SATISFIED` (zero funds moved); after the target's `mark_live()`, a second tranche's `verify_milestone` correctly judged `SATISFIED`, releasing 1 GEN and flipping the tranche to `RELEASED`. First live `verify_milestone` calls in this project's history to complete at all rather than hang.
+- No contract-logic change beyond the single `state=` argument removed and its surrounding comments/docstring updated to document the trade-off; 41/41 tests still passing, `genvm-lint check`/`validate` both clean.
+
 ## [1.5.0] - 2026-09-24
 
 GenLayer Testnet Bradbury's `FeeManager` began reverting on routine fee-quote calls for every deploy/write attempt shortly after the 1.4.0 fix was ready to redeploy, corroborated by an identical failure hitting an unrelated project in this account's portfolio in the same window. The most likely cause: this account's toolchain had already been silently upgraded to the GenLayer Consensus v0.6 / SDK v0.3.0 release train, which Bradbury's older consensus stack cannot correctly serve. This release migrates to **Studio Devnet** (`studioDevnet`, chain id `61997`), porting the contract to the v0.3.0 API.
